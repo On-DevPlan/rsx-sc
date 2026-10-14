@@ -1,0 +1,256 @@
+# 多平台编译 Rust 截屏引擎，产出可直接分发的静态二进制。
+#
+# 分发形态是**单包内嵌**（参考 gh-action/A06）：二进制既随 npm 主包发布，
+# 也作为 GitHub Release 资产单独提供。因此本工作流要做两件事：
+#   1. push 到 main 时，把编译产物**提交回仓库**的 binaries/<platform>-<arch>/
+#      —— npm publish 从 checkout 读仓库内容，二进制必须先入库；
+#   2. 打 tag 时，汇总各平台产物创建 Release（资产带平台前缀避免扁平命名冲突）。
+#
+# 产物目录结构（与 src/core/rust-binary.js 的查找路径一致）：
+#   binaries/win32-x64/rsx-sc-rust.exe
+#   binaries/linux-x64/rsx-sc-rust
+
+name: build-rsx-sc-rust
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'rust/rsx-sc-rust/**'
+      - '.github/workflows/build-rsx-sc-rust.yml'
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'rust/rsx-sc-rust/**'
+      - '.github/workflows/build-rsx-sc-rust.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write    # 提交二进制回仓库 + 打 Release 都需要
+
+# 两个 matrix job 会并发 push 回 main，串行化避免 non-fast-forward 互相打架。
+concurrency:
+  group: build-rsx-sc-rust-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Windows x64 ----
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: win32-x64
+            binary: rsx-sc-rust.exe
+
+          # ---- Linux x64 ----
+          # ubuntu-22.04 → glibc 2.35。`screenshots` crate 需要 libxkbcommon。
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x64
+            binary: rsx-sc-rust
+            linux: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/rsx-sc-rust/target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('rust/rsx-sc-rust/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      # Linux 构建依赖：screenshots crate 的 Wayland 后端（默认启用）需要
+      # libxkbcommon；X11 后端需要 x11 库。
+      - name: 安装 Linux 构建依赖
+        if: matrix.linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libx11-dev pkg-config
+
+      - name: 编译 release
+        working-directory: rust/rsx-sc-rust
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: 整理产物到平台目录
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="rust/rsx-sc-rust/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          OUT="dist/${{ matrix.artifact }}"
+          mkdir -p "$OUT"
+          cp "$SRC" "$OUT/${{ matrix.binary }}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            shasum -a 256 "$OUT/${{ matrix.binary }}" > "$OUT/SHA256SUMS.txt"
+          else
+            sha256sum "$OUT/${{ matrix.binary }}" > "$OUT/SHA256SUMS.txt"
+          fi
+          echo "--- 产物 ---"
+          ls -lh "$OUT"
+          cat "$OUT/SHA256SUMS.txt"
+
+      # Linux 端冒烟测试：起无头 Xvfb，让 loop_capture 真的截屏并产流。
+      # 验证 JSONL 协议 + PNG 编码 + mpsc 背压 + 终止信号全链路。
+      - name: 冒烟测试（Linux + Xvfb）
+        if: matrix.linux
+        shell: bash
+        run: |
+          set -uo pipefail
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1280x1024x24 &
+          sleep 1
+          export DISPLAY=:99
+
+          BIN="dist/${{ matrix.artifact }}/${{ matrix.binary }}"
+          echo "--- version check ---"
+          timeout 5 "$BIN" 2>&1 | head -3 || true
+          echo "--- protocol round-trip ---"
+          RESP=$(printf '{"type":"frame","seq":0,"payload":{"region":{"x":0,"y":0,"width":100,"height":100},"intervalMs":50,"maxFrames":2}}\n' \
+            | DISPLAY=:99 timeout 10 "$BIN" loop_capture 2>/dev/null || true)
+          echo "$RESP" | head -10
+          LINE_COUNT=$(echo "$RESP" | grep -c '^{' || true)
+          echo "line count: $LINE_COUNT"
+          if [ "$LINE_COUNT" -lt 3 ]; then
+            echo "::error::expected at least 3 stdout lines (2 frames + 1 loop_complete); got $LINE_COUNT"
+            exit 1
+          fi
+          LAST_LINE=$(echo "$RESP" | grep '^{' | tail -1)
+          echo "last line: $LAST_LINE"
+          case "$LAST_LINE" in
+            *'"type":"event"'*'"loop_complete"'*) echo "loop_complete 收到" ;;
+            *) echo "::error::最后一行应为 event+loop_complete；got: $LAST_LINE"; exit 1 ;;
+          esac
+          FRAMES_COUNT=$(echo "$RESP" | grep -c '"type":"frame"' || true)
+          echo "frame count: $FRAMES_COUNT"
+          if [ "$FRAMES_COUNT" -lt 2 ]; then
+            echo "::error::expected at least 2 frame envelopes; got $FRAMES_COUNT"
+            exit 1
+          fi
+
+      # 单包内嵌的关键一步：二进制必须入库，npm publish 才能拿到它。
+      # GITHUB_TOKEN 的 push 不会触发下游 workflow（GitHub 防递归），
+      # 所以这里不能指望「提交完自动带起发布」——发布由 push 到 main 触发。
+      - name: 提交二进制回仓库
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          DEST="binaries/${{ matrix.artifact }}/${{ matrix.binary }}"
+          mkdir -p "$(dirname "$DEST")"
+          cp "dist/${{ matrix.artifact }}/${{ matrix.binary }}" "$DEST"
+          git add "$DEST"
+          if git diff --cached --quiet; then
+            echo "binary unchanged"
+            exit 0
+          fi
+          git commit -m "chore(binary): update ${{ matrix.artifact }}/${{ matrix.binary }}"
+          # 另一个 matrix job 可能刚推过，rebase 后重试
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push; then
+              echo "pushed"
+              exit 0
+            fi
+            echo "push attempt $i failed, retrying..."
+            sleep 3
+          done
+          echo "::error::三次重试后仍无法推送二进制"
+          exit 1
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsx-sc-rust-${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}/
+          if-no-files-found: error
+
+  # 打 tag 时汇总所有平台产物并创建 Release
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: false
+
+      - name: 校验各平台产物齐全
+        run: |
+          set -euo pipefail
+          for d in win32-x64 linux-x64; do
+            ls -lh "dist/rsx-sc-rust-$d" || { echo "::error::缺少 $d 产物"; exit 1; }
+          done
+          find dist -type f | sort
+
+      # GitHub Release 的资产是「扁平」的：不同平台若都叫 rsx-sc-rust，
+      # 上传时会互相覆盖。因此统一加上平台前缀。
+      - name: 重命名为带平台前缀的产物
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          for d in win32-x64 linux-x64; do
+            SRC="dist/rsx-sc-rust-$d"
+            BIN=$(ls "$SRC" | grep -v SHA256SUMS | head -1)
+            EXT=""
+            [[ "$BIN" == *.exe ]] && EXT=".exe"
+            TGT="rsx-sc-rust-$d$EXT"
+            cp "$SRC/$BIN" "upload/$TGT"
+            if command -v sha256sum >/dev/null 2>&1; then
+              ( cd upload && sha256sum "$TGT" >> SHA256SUMS-all.txt )
+            else
+              ( cd upload && shasum -a 256 "$TGT" >> SHA256SUMS-all.txt )
+            fi
+          done
+          echo "--- 待上传 ---"
+          ls -lh upload
+          cat upload/SHA256SUMS-all.txt
+
+      - name: 创建 Release 并上传分平台产物
+        uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          generate_release_notes: true
+          draft: false
+          body: |
+            ## rsx-sc-rust ${{ github.ref_name }}
+
+            预编译的截屏引擎（无需用户安装 Rust）。正常情况下用户不需要手动下载——
+            `npx rsx-sc` 已经随主包分发对应平台的二进制。
+
+            | 资产 | 平台 | 说明 |
+            | --- | --- | --- |
+            | `rsx-sc-rust-win32-x64.exe` | Windows x64 | |
+            | `rsx-sc-rust-linux-x64` | Linux x64 | 需 `libxkbcommon` 与 X11 / Wayland |
+
+            `SHA256SUMS-all.txt` 含全部资产的校验和。
+
+            > 手动部署时把文件放为 `<仓库>/binaries/<平台>-<架构>/rsx-sc-rust[.exe]`，
+            > 或用环境变量 `RSX_SC_BINARY=<绝对路径>` 显式指定。

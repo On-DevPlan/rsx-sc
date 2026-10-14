@@ -1,0 +1,39 @@
+node_modules/
+src/web/public/
+*.log
+.DS_Store
+.env
+.env.local
+.nx-rp-workflows/
+*.tgz
+
+# Rust crate build artifacts
+rust/rsx-sc-rust/target/
+rust/**/target/
+
+# GH Actions dist/ output
+dist/
+
+# 单包内嵌：二进制随主包发布，必须入库（npm publish 从 checkout 读）。
+# CI（build-rsx-sc-rust.yml）编译后会把新二进制提交回来。
+!binaries/.gitkeep
+
+# ============================================================
+# Cloned repositories (nested git repos) — sl-git-standard
+# 父目录必须用 /* 半透明模式，否则否定规则失效
+# ============================================================
+.claude/repo/*
+!.claude/repo/_read/
+!.claude/repo/_read/**
+
+!.claude/repo/_self/
+!.claude/repo/_self/**
+
+# git.remote 清单：团队共享状态，入库（别人 clone 本仓库后 sync 即可重建 .claude/repo）
+!.claude/www/
+
+# Tool artifacts / scratch tools (本地工具产物，不入库)
+.tool/
+
+# Playwright MCP 调试产物（浏览器自动化临时日志/快照）
+.playwright-mcp/

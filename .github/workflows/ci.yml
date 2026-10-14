@@ -1,0 +1,39 @@
+name: CI
+
+# 与 npm-publish.yml 分开：那条只在 main 上跑发布，这条对每次 push / PR 做校验。
+# 改造前只有发布流水线，PR 阶段没有任何护栏——冒烟测试是在发版那一刻才跑的。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint（含分层约束）
+        run: pnpm run lint
+
+      - name: 单元测试与一致性断言
+        run: pnpm run test:unit
+
+      - name: 构建前端
+        run: pnpm run build
+
+      - name: 端到端冒烟
+        run: pnpm run test:smoke
