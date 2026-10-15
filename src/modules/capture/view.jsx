@@ -3,8 +3,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { api } from '../../web/frontend/api/client.js';
 import { CliHints } from '../../web/frontend/components/CliHints.jsx';
 import { useToast } from '../../web/frontend/components/ui.jsx';
-
-const MAX_TURNS = 200;
+import { NumInput, BinCard, Bubble, trim } from './parts.jsx';
 
 export default function CaptureView() {
   const toast = useToast();
@@ -14,6 +13,8 @@ export default function CaptureView() {
   const [maxFrames, setMaxFrames] = useState('');
   const [sessionId, setSessionId] = useState(null);
   const [stats, setStats] = useState(null);
+  const [monitorIndex, setMonitorIndex] = useState(null);
+  const [picking, setPicking] = useState(false);
   const [turns, setTurns] = useState([]); // {role, payload, ts}
   const [note, setNote] = useState('');
   const esRef = useRef(null);
@@ -89,6 +90,26 @@ export default function CaptureView() {
     };
   }, [sessionId, toast]);
 
+  // 原生全屏框选：阻塞到用户拖完（或 Esc/右键取消）。
+  // timeoutMs 必须大于服务端 5 分钟兜底，让服务端的超时错误先到。
+  const pick = useCallback(async () => {
+    setPicking(true);
+    try {
+      const r = await api('/api/capture/select', { method: 'POST', body: {}, timeoutMs: 330000 });
+      if (r.status === 'cancelled') {
+        toast('已取消框选');
+        return;
+      }
+      setRegion({ x: r.region.x, y: r.region.y, w: r.region.width, h: r.region.height });
+      setMonitorIndex(r.monitorIndex);
+      toast(`已框选 ${r.region.width}×${r.region.height}（显示器 ${r.monitorIndex}）`);
+    } catch (e) {
+      toast(String(e.message || e));
+    } finally {
+      setPicking(false);
+    }
+  }, [toast]);
+
   const start = useCallback(async () => {
     try {
       const out = await api('/api/capture/start', {
@@ -97,6 +118,7 @@ export default function CaptureView() {
           region: `${region.x},${region.y},${region.w},${region.h}`,
           intervalMs,
           maxFrames: maxFrames ? Number(maxFrames) : null,
+          monitor: monitorIndex,
         },
       });
       setTurns([]);
@@ -106,7 +128,7 @@ export default function CaptureView() {
     } catch (e) {
       toast(String(e.message || e));
     }
-  }, [region, intervalMs, maxFrames, toast]);
+  }, [region, intervalMs, maxFrames, monitorIndex, toast]);
 
   const stop = useCallback(async () => {
     if (!sessionId) return;
@@ -137,11 +159,20 @@ export default function CaptureView() {
         </div>
         <div className="row">
           <div className="name">区域 (x,y,w,h)</div>
-          <div className="desc" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <div className="desc" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
             <NumInput value={region.x} onChange={(v) => setRegion((r) => ({ ...r, x: v }))} label="x" />
             <NumInput value={region.y} onChange={(v) => setRegion((r) => ({ ...r, y: v }))} label="y" />
             <NumInput value={region.w} onChange={(v) => setRegion((r) => ({ ...r, w: v }))} label="w" />
             <NumInput value={region.h} onChange={(v) => setRegion((r) => ({ ...r, h: v }))} label="h" />
+            <button
+              className="btn ghost"
+              onClick={pick}
+              disabled={!bin?.found || picking || !!sessionId}
+              title="弹出全屏蒙版，鼠标拖拽框选；Esc 或右键取消"
+            >
+              {picking ? '等待框选…' : '框选区域'}
+            </button>
+            {monitorIndex !== null ? <span className="tag">显示器 {monitorIndex}</span> : null}
           </div>
         </div>
         <div className="row">
@@ -222,95 +253,4 @@ export default function CaptureView() {
   );
 }
 
-function NumInput({ value, onChange, label }) {
-  return (
-    <label className="muted" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-      {label}
-      <input
-        type="number"
-        min={0}
-        className="input"
-        style={{ width: 80 }}
-        value={value}
-        onChange={(e) => onChange(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
-      />
-    </label>
-  );
-}
 
-function BinCard({ bin }) {
-  if (!bin) return null;
-  if (!bin.supported) {
-    return (
-      <div className="empty bad">
-        当前平台 {bin.platform}/{bin.arch} 不在 v1 支持范围（仅 Windows x64 与 Linux x64）。
-      </div>
-    );
-  }
-  if (!bin.found) {
-    return (
-      <div className="empty bad">
-        未找到 rsx-sc-rust 二进制：{bin.reason}
-        <CliHints
-          command="cd rust/rsx-sc-rust && cargo build --release"
-          note="构建后复制到 binaries/<key>/ 或安装平台分包 @ondevplann/rsx-sc-rust-<key>"
-        />
-      </div>
-    );
-  }
-  return (
-    <div className="card">
-      <div className="colhead">
-        <span>二进制</span>
-        <span className="tag">{bin.source}</span>
-      </div>
-      <div className="row">
-        <div className="name">路径</div>
-        <div className="desc mono nowrap">{bin.path}</div>
-      </div>
-      <div className="row">
-        <div className="name">平台</div>
-        <div className="desc mono">{bin.platform}/{bin.arch}</div>
-      </div>
-      <CliHints command="rsx-sc capture bin" note="CLI 与 HTTP 返回同一份解析结果" />
-    </div>
-  );
-}
-
-function Bubble({ turn }) {
-  if (turn.role === 'frame') {
-    const f = turn.payload;
-    return (
-      <div className="bubble in">
-        <div className="bubble-meta">
-          <span className="tag">frame #{f.seq}</span>
-          <span className="muted">{(f.capturedAtMs ? new Date(f.capturedAtMs).toLocaleTimeString() : '')}</span>
-        </div>
-        <img
-          alt={`frame ${f.seq}`}
-          src={`data:image/png;base64,${f.pngB64}`}
-          style={{ maxWidth: '100%', borderRadius: 6, marginTop: 6 }}
-        />
-        <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
-          {f.width}×{f.height}
-        </div>
-      </div>
-    );
-  }
-  if (turn.role === 'note') {
-    return (
-      <div className="bubble out">
-        <div className="bubble-meta">
-          <span className="tag">注解</span>
-        </div>
-        <div className="bubble-text">{turn.payload.content}</div>
-      </div>
-    );
-  }
-  return null;
-}
-
-function trim(arr) {
-  if (arr.length <= MAX_TURNS) return arr;
-  return arr.slice(arr.length - MAX_TURNS);
-}

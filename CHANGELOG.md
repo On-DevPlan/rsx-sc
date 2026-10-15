@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0 — 2026-10-15
+
+### 新增
+
+- **原生全屏框选蒙版**（`rsx-sc-rust select`，`rust/rsx-sc-rust/src/overlay.rs`）。
+  从 tauri2 的 `capture_window.rs` 移植：winit + softbuffer 直接绘制原生窗口，
+  截光标所在显示器整屏 → 压暗 → 拖拽画框（框内还原原始像素、蓝色边框、
+  四角绿色 L 形标记）→ 输出选中矩形 JSON。Esc / 右键取消，数位笔走
+  `WM_POINTER` 同样可用。
+  - 与 tauri2 的差异：删掉常驻后台线程 + `EventLoopProxy` 单例——新进程
+    每次只跑一个 `select`，事件循环直接归主线程。
+  - 先画好首帧再显示窗口，无白屏闪烁。
+- CLI / API：`rsx-sc capture select`（`POST /api/capture/select`）。
+- Web 面板「截屏」页新增「框选区域」按钮：调 `/api/capture/select`
+  （长超时，等用户拖完），把结果写回 region 输入框并显示显示器下标。
+- `capture.start` 新增 `--monitor <下标>`：把循环锁定到框选时那块显示器，
+  避免框选后鼠标挪屏导致区域裁错屏。`loop_capture` 输入增加 `monitor` 字段。
+- `MonitorInfo` 相关的按索引解析：`find_cursor_monitor_indexed` /
+  `monitor_from_index`。
+
+### 变更
+
+- Rust 依赖新增 `winit 0.30` + `softbuffer 0.4`（与 tauri2 同版本）。
+  二进制从 ~578 KB 增至 ~773 KB。
+- `src/modules/capture/view.jsx` 拆出展示组件到 `parts.jsx`
+  （eslint `max-lines` 300 行上限）。
+
+### 已知限制
+
+- `select` 需要图形界面；无显示的服务器里请用 `--region` 显式给坐标。
+
 ## 0.2.0 — 2026-10-14
 
 ### 新增

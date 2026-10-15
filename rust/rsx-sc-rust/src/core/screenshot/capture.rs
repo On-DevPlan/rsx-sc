@@ -49,6 +49,61 @@ pub fn find_cursor_monitor() -> AppResult<CursorMonitor> {
     })
 }
 
+/// Find the monitor under the cursor, plus its index in `Screen::all()`.
+/// The index lets `loop_capture` re-resolve the SAME monitor later even if
+/// the cursor has moved away (select → start 的跨调用坐标锚点).
+#[cfg(not(target_os = "macos"))]
+pub fn find_cursor_monitor_indexed() -> AppResult<(CursorMonitor, usize)> {
+    let (cursor_x, cursor_y) = cursor_position()?;
+    let all = screenshots::Screen::all()
+        .map_err(|e| AppError::Capture(format!("enumerate screens: {e}")))?;
+    let screen = screenshots::Screen::from_point(cursor_x, cursor_y)
+        .map_err(|e| AppError::Capture(format!("no screen at ({cursor_x},{cursor_y}): {e}")))?;
+    let index = all
+        .iter()
+        .position(|s| s.display_info.id == screen.display_info.id)
+        .unwrap_or(0);
+    let info = &screen.display_info;
+    Ok((
+        CursorMonitor {
+            screen,
+            monitor: MonitorInfo {
+                scale_factor: info.scale_factor as f64,
+                x: info.x,
+                y: info.y,
+                width: info.width,
+                height: info.height,
+            },
+        },
+        index,
+    ))
+}
+
+/// Resolve a monitor by its index in `Screen::all()` (same ordering that
+/// `find_cursor_monitor_indexed` reports). Used by `loop_capture` when the
+/// caller pins the monitor explicitly.
+#[cfg(not(target_os = "macos"))]
+pub fn monitor_from_index(index: usize) -> AppResult<CursorMonitor> {
+    let all = screenshots::Screen::all()
+        .map_err(|e| AppError::Capture(format!("enumerate screens: {e}")))?;
+    let total = all.len();
+    let screen = all
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| AppError::Capture(format!("monitor index {index} 不存在（共 {total} 块）")))?;
+    let info = &screen.display_info;
+    Ok(CursorMonitor {
+        screen,
+        monitor: MonitorInfo {
+            scale_factor: info.scale_factor as f64,
+            x: info.x,
+            y: info.y,
+            width: info.width,
+            height: info.height,
+        },
+    })
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn capture_screen_rgba(monitor: &CursorMonitor) -> AppResult<(Vec<u8>, u32, u32)> {
     let capture = monitor
@@ -117,6 +172,20 @@ pub fn find_cursor_monitor() -> AppResult<CursorMonitor> {
 
 #[cfg(target_os = "macos")]
 pub fn capture_screen_rgba(_monitor: &CursorMonitor) -> AppResult<(Vec<u8>, u32, u32)> {
+    Err(AppError::Capture(
+        "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub fn find_cursor_monitor_indexed() -> AppResult<(CursorMonitor, usize)> {
+    Err(AppError::Capture(
+        "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub fn monitor_from_index(_index: usize) -> AppResult<CursorMonitor> {
     Err(AppError::Capture(
         "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
     ))

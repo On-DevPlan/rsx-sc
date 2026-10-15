@@ -20,6 +20,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time", "signal"] }
+# Native fullscreen selection overlay (ported from tauri2's capture_window.rs).
+# Same crates + versions as the tauri2 app, minus tauri itself.
+softbuffer = "0.4"
+winit = { version = "0.30", features = ["rwh_06"] }
 
 [features]
 default = []
@@ -28,6 +32,12 @@ default = []
 opt-level = 2
 
 [profile.dev.package.image]
+opt-level = 2
+
+[profile.dev.package.softbuffer]
+opt-level = 2
+
+[profile.dev.package.winit]
 opt-level = 2
 
 # Release profile is tuned for small binary size: this tool spawns a subprocess

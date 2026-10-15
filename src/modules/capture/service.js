@@ -11,6 +11,7 @@ import {
   buildVisionMessages,
 } from '../../core/llm-client.js';
 import { readSettings } from '../../core/settings-store.js';
+import { runSelection } from '../../core/select-client.js';
 import { badInput, external } from '../../core/errors/index.js';
 
 const MIN_INTERVAL_MS = 50;
@@ -59,7 +60,7 @@ export async function bin() {
  * @param {{region: string, intervalMs: number, maxFrames?: number|null}} opts
  * @returns {Promise<{sessionId: string, startedAt: number, region: object, intervalMs: number, maxFrames: number|null}>}
  */
-export async function start({ region, intervalMs, maxFrames }) {
+export async function start({ region, intervalMs, maxFrames, monitor }) {
   const r = resolveBinary();
   if (!r) {
     if (!isSupported(process.platform, process.arch)) {
@@ -79,12 +80,22 @@ export async function start({ region, intervalMs, maxFrames }) {
   if (!Number.isFinite(interval) || interval < MIN_INTERVAL_MS) {
     throw badInput(`intervalMs 必须 ≥ ${MIN_INTERVAL_MS}（收到: ${intervalMs}）`);
   }
+  // 框选产出的显示器锚点：缺省 = 光标所在显示器；显式给定则锁定该屏，
+  // 避免「框选完鼠标挪走、循环起在另一块屏」的坐标错位。
+  let monitorIndex = null;
+  if (monitor !== undefined && monitor !== null) {
+    if (!Number.isInteger(Number(monitor)) || Number(monitor) < 0) {
+      throw badInput(`monitor 必须是非负整数（收到: ${monitor}）`);
+    }
+    monitorIndex = Number(monitor);
+  }
 
   const session = createSession({
     region: parsed,
     intervalMs: interval,
     maxFrames: maxFrames ?? null,
     binPath: r.path,
+    monitor: monitorIndex,
   });
 
   return {
@@ -93,7 +104,39 @@ export async function start({ region, intervalMs, maxFrames }) {
     region: parsed,
     intervalMs: interval,
     maxFrames: maxFrames ?? null,
+    monitor: monitorIndex,
   };
+}
+
+/**
+ * 弹出原生全屏框选蒙版，阻塞到用户完成或取消。
+ * 交互时长不可预知：HTTP 调用方（面板）要传足够大的 timeoutMs；CLI 无超时。
+ * 服务端 5 分钟兜底：超时杀掉蒙版进程，不让全屏遮罩永远挂着。
+ */
+export async function select() {
+  const r = resolveBinary();
+  if (!r) {
+    if (!isSupported(process.platform, process.arch)) {
+      throw external(`v1 不支持 ${process.platform}/${process.arch}（仅 Windows x64 与 Linux x64）`);
+    }
+    throw external('未找到 rsx-sc-rust 二进制。请先 cargo build --release');
+  }
+  const out = await runSelection({ binPath: r.path, timeoutMs: 5 * 60_000 });
+  switch (out.status) {
+    case 'cancelled':
+      return { status: 'cancelled' };
+    case 'timeout':
+      throw external('框选超时（5 分钟未操作，蒙版已自动关闭）');
+    case 'error':
+      throw external(`框选失败: ${out.message}`);
+    default: {
+      const { region, monitorIndex } = out;
+      if (region.width === 0 || region.height === 0) {
+        throw badInput(`框选区域宽高为零: ${JSON.stringify(region)}`);
+      }
+      return { status: 'ok', region, monitorIndex };
+    }
+  }
 }
 
 export async function stop({ sessionId }) {

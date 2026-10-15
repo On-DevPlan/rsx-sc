@@ -17,6 +17,9 @@ npx rsx-sc capture bin
 # 起一个截屏会话（CLI 与 HTTP 同源）
 npx rsx-sc capture start --region "0,0,800,600" --intervalMs 500
 
+# 或者：弹原生全屏蒙版，鼠标框选一个区域（Esc / 右键取消）
+npx rsx-sc capture select
+
 # 列出/停止会话
 npx rsx-sc capture list --json
 npx rsx-sc capture stop --sessionId <id>
@@ -58,6 +61,34 @@ npx rsx-sc settings test
 | `capture`      | 单次 BitBlt 截屏（诊断用）           |
 | `crop`         | 在 PNG 上裁一个矩形                  |
 | `loop_capture` | 按固定间隔连续截屏一个区域，输出帧流 |
+| `select`       | 原生全屏框选蒙版，输出选中矩形 JSON  |
+
+### 框选蒙版 `select`
+
+从 tauri2 的 `capture_window.rs` 移植（`rust/rsx-sc-rust/src/overlay.rs`），
+仍是 winit + softbuffer 直接绘制到原生窗口——没有 WebView，没有白闪：
+
+- 截取光标所在显示器的整屏快照 → 建无边框、置顶、全屏窗口 →
+  **先把压暗的快照画好再显示**（用户看不到白屏）
+- 拖拽画框：框内还原原始像素、蓝色边框、四角绿色 L 形标记
+  （表示「该区域会被循环截屏」）
+- 交互约定与主流截屏工具一致：**左键拖拽选中，Esc / 右键取消**
+- Windows 上数位笔 / 触摸屏走 `WM_POINTER`，同样可以拖拽
+
+与 tauri2 的结构差异：tauri2 是常驻 GUI 应用，winit 每进程只允许一个
+EventLoop，所以它用常驻后台线程 + `EventLoopProxy` 派发。本二进制每次
+`select` 都是新进程，事件循环直接归主线程所有，那套 proxy 单例被整个删掉。
+
+输出是一行 JSON（不是 Envelope——它是交互式子命令，不是 JSONL 节点）：
+
+```json
+{"ok":true,"x":399,"y":399,"width":397,"height":205,"monitorIndex":0}
+{"ok":true,"cancelled":true}
+```
+
+`monitorIndex` 会一路带到 `capture.start --monitor <下标>`，让
+`loop_capture` **锁定同一块显示器**——否则框选完鼠标挪到另一块屏，
+循环就会把区域裁到错误的屏幕上。
 
 `loop_capture` 是新写的节点：`tokio::time::sleep` 提供稳定时基，
 `spawn_blocking` 跑阻塞的 `screenshots::Screen::capture()`，
@@ -124,6 +155,8 @@ cp target/release/rsx-sc-rust[.exe] ../binaries/win32-x64/
 ## 局限（v1）
 
 - macOS 不支持（Rust 端返回 "v1 仅支持 Windows / Linux" 错误 envelope）。
+- `select` 蒙版需要**图形界面**：无显示的服务器/容器里会报错，此时用
+  `--region` 显式给坐标。
 - 仅随包分发 x64（win32-x64 / linux-x64）。
 - 仅 OpenAI 兼容的 chat/completions；流式响应未启用。
 - LLM 调用是「单串行」（一次只发一个 in-flight 请求），并发截屏高 interval

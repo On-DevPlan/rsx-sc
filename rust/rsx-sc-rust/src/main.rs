@@ -1,10 +1,12 @@
 //! rsx-sc-rust — capture-only screenshot binary.
 //!
 //! Multi-call dispatcher:
-//!   * `rsx-sc-rust`           → print usage + exit 1
-//!   * `rsx-sc-rust capture`   → one-shot monitor capture (PNG base64)
-//!   * `rsx-sc-rust crop`      → crop a rectangle out of a PNG
-//!   * `rsx-sc-rust loop_capture` → continuous region capture (PNG frames stream)
+//!   * `rsx-sc-rust`             → print usage + exit 1
+//!   * `rsx-sc-rust capture`     → one-shot monitor capture (PNG base64)
+//!   * `rsx-sc-rust crop`        → crop a rectangle out of a PNG
+//!   * `rsx-sc-rust loop_capture`→ continuous region capture (PNG frames stream)
+//!   * `rsx-sc-rust select`      → native fullscreen box-select overlay;
+//!                                 prints the chosen region as JSON on stdout
 //!
 //! Invoked by the Node `capture-client.js` driver over stdio (JSONL envelopes
 //! on stdin/stdout). Each node owns its own stdin/stdout lifecycle; `run`
@@ -12,6 +14,7 @@
 
 mod core;
 mod error;
+mod overlay;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -52,7 +55,8 @@ fn print_usage() {
          Nodes:\n  \
            capture       one-shot monitor capture (PNG base64)\n  \
            crop          crop a rectangle out of a PNG\n  \
-           loop_capture  continuous region capture (PNG frames stream)\n",
+           loop_capture  continuous region capture (PNG frames stream)\n  \
+           select        native fullscreen box-select overlay (JSON on stdout)\n",
         env!("CARGO_PKG_VERSION")
     );
 }

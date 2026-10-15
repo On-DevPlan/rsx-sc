@@ -48,7 +48,8 @@ use tokio::time::Duration;
 
 use crate::core::node::{write_envelope_line, write_event_line};
 use crate::core::screenshot::capture::{
-    capture_screen_rgba, crop_rgba, encode_png, find_cursor_monitor, MonitorInfo,
+    capture_screen_rgba, crop_rgba, encode_png, find_cursor_monitor, monitor_from_index,
+    MonitorInfo,
 };
 use crate::error::{AppError, AppResult};
 
@@ -74,6 +75,10 @@ pub struct LoopCaptureInput {
     /// `None` means run until SIGTERM / max_frames hit externally.
     #[serde(default)]
     pub max_frames: Option<u64>,
+    /// 显示器下标（`Screen::all()` 顺序，由 `select` 输出的 monitorIndex 提供）。
+    /// `None` = 光标所在显示器。显式指定可避免「框选完鼠标挪走」导致的错屏。
+    #[serde(default)]
+    pub monitor: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,9 +175,14 @@ where
 {
     // Resolve monitor ONCE. The cursor moving during the loop does not
     // change which monitor the user originally selected.
-    let cursor_monitor = tokio::task::spawn_blocking(find_cursor_monitor)
-        .await
-        .map_err(|e| AppError::Capture(format!("monitor join error: {e}")))??;
+    let cursor_monitor = match input.monitor {
+        Some(index) => tokio::task::spawn_blocking(move || monitor_from_index(index))
+            .await
+            .map_err(|e| AppError::Capture(format!("monitor join error: {e}")))??,
+        None => tokio::task::spawn_blocking(find_cursor_monitor)
+            .await
+            .map_err(|e| AppError::Capture(format!("monitor join error: {e}")))??,
+    };
     let MonitorInfo {
         scale_factor: _,
         x: mon_x,

@@ -19,7 +19,7 @@ use crate::error::{AppError, AppResult};
 /// so typos surface as clear messages rather than silent no-ops.
 pub async fn run_node(name: &str) -> AppResult<()> {
     match name {
-        "capture" | "crop" | "loop_capture" => screenshot::run_node(name).await,
+        "capture" | "crop" | "loop_capture" | "select" => screenshot::run_node(name).await,
         unknown => Err(AppError::Capture(format!("unknown node: {unknown}"))),
     }
 }
