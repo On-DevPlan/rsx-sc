@@ -13,7 +13,6 @@ export default function CaptureView() {
   const [maxFrames, setMaxFrames] = useState('');
   const [sessionId, setSessionId] = useState(null);
   const [stats, setStats] = useState(null);
-  const [monitorIndex, setMonitorIndex] = useState(null);
   const [picking, setPicking] = useState(false);
   const [turns, setTurns] = useState([]); // {role, payload, ts}
   const [note, setNote] = useState('');
@@ -90,7 +89,7 @@ export default function CaptureView() {
     };
   }, [sessionId, toast]);
 
-  // 原生全屏框选：阻塞到用户拖完（或 Esc/右键取消）。
+  // 原生框选：蒙版铺满所有显示器，可以跨屏拖拽。
   // timeoutMs 必须大于服务端 5 分钟兜底，让服务端的超时错误先到。
   const pick = useCallback(async () => {
     setPicking(true);
@@ -101,8 +100,7 @@ export default function CaptureView() {
         return;
       }
       setRegion({ x: r.region.x, y: r.region.y, w: r.region.width, h: r.region.height });
-      setMonitorIndex(r.monitorIndex);
-      toast(`已框选 ${r.region.width}×${r.region.height}（显示器 ${r.monitorIndex}）`);
+      toast(`已框选 ${r.region.width}×${r.region.height}`);
     } catch (e) {
       toast(String(e.message || e));
     } finally {
@@ -118,7 +116,6 @@ export default function CaptureView() {
           region: `${region.x},${region.y},${region.w},${region.h}`,
           intervalMs,
           maxFrames: maxFrames ? Number(maxFrames) : null,
-          monitor: monitorIndex,
         },
       });
       setTurns([]);
@@ -128,7 +125,7 @@ export default function CaptureView() {
     } catch (e) {
       toast(String(e.message || e));
     }
-  }, [region, intervalMs, maxFrames, monitorIndex, toast]);
+  }, [region, intervalMs, maxFrames, toast]);
 
   const stop = useCallback(async () => {
     if (!sessionId) return;
@@ -160,19 +157,18 @@ export default function CaptureView() {
         <div className="row">
           <div className="name">区域 (x,y,w,h)</div>
           <div className="desc" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-            <NumInput value={region.x} onChange={(v) => setRegion((r) => ({ ...r, x: v }))} label="x" />
-            <NumInput value={region.y} onChange={(v) => setRegion((r) => ({ ...r, y: v }))} label="y" />
+            <NumInput value={region.x} onChange={(v) => setRegion((r) => ({ ...r, x: v }))} label="x" allowNegative />
+            <NumInput value={region.y} onChange={(v) => setRegion((r) => ({ ...r, y: v }))} label="y" allowNegative />
             <NumInput value={region.w} onChange={(v) => setRegion((r) => ({ ...r, w: v }))} label="w" />
             <NumInput value={region.h} onChange={(v) => setRegion((r) => ({ ...r, h: v }))} label="h" />
             <button
               className="btn ghost"
               onClick={pick}
               disabled={!bin?.found || picking || !!sessionId}
-              title="弹出全屏蒙版，鼠标拖拽框选；Esc 或右键取消"
+              title="弹出原生蒙版（铺满所有显示器，可跨屏拖拽）；Esc 或右键取消"
             >
               {picking ? '等待框选…' : '框选区域'}
             </button>
-            {monitorIndex !== null ? <span className="tag">显示器 {monitorIndex}</span> : null}
           </div>
         </div>
         <div className="row">

@@ -30,67 +30,126 @@ pub struct CursorMonitor {
     pub monitor: MonitorInfo,
 }
 
+/// 虚拟桌面坐标下的矩形。
+///
+/// 原点 = 所有显示器并集的左上角，**允许负坐标**（副屏在主屏左边时 x 为负），
+/// 且可以**跨屏**——这是多显示器下唯一能表达「横跨两块屏的选区」的坐标系。
+/// 显示器之间的空隙在输出里留黑。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 所有显示器并集的包围盒（虚拟桌面），返回 (x, y, width, height)。
+#[cfg(not(target_os = "macos"))]
+pub fn virtual_desktop_bounds() -> AppResult<(i32, i32, u32, u32)> {
+    let all = screenshots::Screen::all()
+        .map_err(|e| AppError::Capture(format!("enumerate screens: {e}")))?;
+    if all.is_empty() {
+        return Err(AppError::Capture("没有检测到任何显示器".into()));
+    }
+    let min_x = all.iter().map(|s| s.display_info.x).min().unwrap_or(0);
+    let min_y = all.iter().map(|s| s.display_info.y).min().unwrap_or(0);
+    let max_x = all
+        .iter()
+        .map(|s| s.display_info.x + s.display_info.width as i32)
+        .max()
+        .unwrap_or(0);
+    let max_y = all
+        .iter()
+        .map(|s| s.display_info.y + s.display_info.height as i32)
+        .max()
+        .unwrap_or(0);
+    Ok((min_x, min_y, (max_x - min_x).max(0) as u32, (max_y - min_y).max(0) as u32))
+}
+
+/// 抓取虚拟桌面坐标下的任意矩形：与每块显示器求交，逐块捕获后拷贝进输出缓冲。
+///
+/// 返回 (rgba, width, height)。宽松实现——每块屏整屏捕获再裁切，与单屏路径
+/// 一样的成本量级，换来的是「跨屏选区」能用一个统一模型表达。
+#[cfg(not(target_os = "macos"))]
+pub fn capture_virtual_region(r: &VirtualRegion) -> AppResult<(Vec<u8>, u32, u32)> {
+    if r.width == 0 || r.height == 0 {
+        return Err(AppError::Capture(format!(
+            "region 宽高不能为零: {}x{}",
+            r.width, r.height
+        )));
+    }
+    let screens = screenshots::Screen::all()
+        .map_err(|e| AppError::Capture(format!("enumerate screens: {e}")))?;
+    let mut out = vec![0u8; (r.width as usize) * (r.height as usize) * 4];
+    let mut covered = false;
+
+    for screen in screens {
+        let di = &screen.display_info;
+        // 选区与本显示器的交集（虚拟桌面绝对坐标）
+        let ix1 = r.x.max(di.x);
+        let iy1 = r.y.max(di.y);
+        let ix2 = (r.x + r.width as i32).min(di.x + di.width as i32);
+        let iy2 = (r.y + r.height as i32).min(di.y + di.height as i32);
+        if ix2 <= ix1 || iy2 <= iy1 {
+            continue; // 不相交
+        }
+
+        let cap = screen
+            .capture()
+            .map_err(|e| AppError::Capture(e.to_string()))?;
+        let (cw, ch) = (cap.width(), cap.height());
+        let src = cap.into_raw();
+
+        let bw = (ix2 - ix1) as u32;
+        let bh = (iy2 - iy1) as u32;
+        let sx = (ix1 - di.x) as u32;
+        let sy = (iy1 - di.y) as u32;
+        let dx = (ix1 - r.x) as u32;
+        let dy = (iy1 - r.y) as u32;
+
+        // 报告分辨率与实际捕获不符时跳过这一块，别越界读
+        if sx + bw > cw || sy + bh > ch {
+            continue;
+        }
+        for row in 0..bh {
+            let s = (((sy + row) * cw + sx) as usize) * 4;
+            let d = ((((dy + row) * r.width) + dx) as usize) * 4;
+            let len = (bw as usize) * 4;
+            out[d..d + len].copy_from_slice(&src[s..s + len]);
+        }
+        covered = true;
+    }
+
+    if !covered {
+        return Err(AppError::Capture(format!(
+            "region ({},{}) {}x{} 与任何显示器都不相交",
+            r.x, r.y, r.width, r.height
+        )));
+    }
+    Ok((out, r.width, r.height))
+}
+
+/// 把整个虚拟桌面截下来（供框选蒙版当底图）。
+/// 返回 (rgba, width, height, origin_x, origin_y)。
+#[cfg(not(target_os = "macos"))]
+pub fn capture_virtual_desktop() -> AppResult<(Vec<u8>, u32, u32, i32, i32)> {
+    let (ox, oy, w, h) = virtual_desktop_bounds()?;
+    let (rgba, rw, rh) = capture_virtual_region(&VirtualRegion {
+        x: ox,
+        y: oy,
+        width: w,
+        height: h,
+    })?;
+    Ok((rgba, rw, rh, ox, oy))
+}
+
 /// Find the monitor under the cursor (Windows / Linux).
 #[cfg(not(target_os = "macos"))]
 pub fn find_cursor_monitor() -> AppResult<CursorMonitor> {
     let (cursor_x, cursor_y) = cursor_position()?;
     let screen = screenshots::Screen::from_point(cursor_x, cursor_y)
         .map_err(|e| AppError::Capture(format!("no screen at ({cursor_x},{cursor_y}): {e}")))?;
-    let info = &screen.display_info;
-    Ok(CursorMonitor {
-        screen,
-        monitor: MonitorInfo {
-            scale_factor: info.scale_factor as f64,
-            x: info.x,
-            y: info.y,
-            width: info.width,
-            height: info.height,
-        },
-    })
-}
-
-/// Find the monitor under the cursor, plus its index in `Screen::all()`.
-/// The index lets `loop_capture` re-resolve the SAME monitor later even if
-/// the cursor has moved away (select → start 的跨调用坐标锚点).
-#[cfg(not(target_os = "macos"))]
-pub fn find_cursor_monitor_indexed() -> AppResult<(CursorMonitor, usize)> {
-    let (cursor_x, cursor_y) = cursor_position()?;
-    let all = screenshots::Screen::all()
-        .map_err(|e| AppError::Capture(format!("enumerate screens: {e}")))?;
-    let screen = screenshots::Screen::from_point(cursor_x, cursor_y)
-        .map_err(|e| AppError::Capture(format!("no screen at ({cursor_x},{cursor_y}): {e}")))?;
-    let index = all
-        .iter()
-        .position(|s| s.display_info.id == screen.display_info.id)
-        .unwrap_or(0);
-    let info = &screen.display_info;
-    Ok((
-        CursorMonitor {
-            screen,
-            monitor: MonitorInfo {
-                scale_factor: info.scale_factor as f64,
-                x: info.x,
-                y: info.y,
-                width: info.width,
-                height: info.height,
-            },
-        },
-        index,
-    ))
-}
-
-/// Resolve a monitor by its index in `Screen::all()` (same ordering that
-/// `find_cursor_monitor_indexed` reports). Used by `loop_capture` when the
-/// caller pins the monitor explicitly.
-#[cfg(not(target_os = "macos"))]
-pub fn monitor_from_index(index: usize) -> AppResult<CursorMonitor> {
-    let all = screenshots::Screen::all()
-        .map_err(|e| AppError::Capture(format!("enumerate screens: {e}")))?;
-    let total = all.len();
-    let screen = all
-        .into_iter()
-        .nth(index)
-        .ok_or_else(|| AppError::Capture(format!("monitor index {index} 不存在（共 {total} 块）")))?;
     let info = &screen.display_info;
     Ok(CursorMonitor {
         screen,

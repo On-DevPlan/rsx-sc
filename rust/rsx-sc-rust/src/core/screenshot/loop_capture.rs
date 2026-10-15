@@ -5,11 +5,19 @@
 //! `max_frames` is reached or the parent process kills us (SIGTERM / Windows
 //! terminate / EOF-on-stdin).
 //!
+//! ## 坐标系：虚拟桌面绝对坐标
+//!
+//! `region` 是**虚拟桌面绝对坐标**（原点 = 所有显示器并集的左上角），允许负
+//! 坐标、允许跨屏。每帧把区域与各显示器求交后逐块拼接
+//! （`capture::capture_virtual_region`）——这是唯一能表达「横跨两块屏的选区」
+//! 的模型。单屏场景下它就是原来的行为，只是原点从「该屏左上角」换成了
+//! 「并集左上角」，而 `select` 输出的正是同一坐标系，两者直接对接。
+//!
 //! ## Why not many one-shot `capture` calls?
 //!
 //! JS-side timing (`setInterval` / `setTimeout`) drifts under GC pressure and
 //! EventLoop backpressure. Internal `tokio::time::sleep` is the timing source
-//! of truth. Each frame is also cropped + PNG-encoded inside a
+//! of truth. Each frame is captured off the async runtime in a
 //! `spawn_blocking` so the JSONL writer is never starved.
 //!
 //! ## Backpressure
@@ -33,8 +41,7 @@
 //! ## macOS
 //!
 //! Stub returning the same "v1 仅支持 Windows / Linux" error as the one-shot
-//! `capture` node. The Node layer is responsible for gating per-platform, but
-//! the binary still produces a useful error envelope if invoked directly.
+//! `capture` node.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -48,37 +55,21 @@ use tokio::time::Duration;
 
 use crate::core::node::{write_envelope_line, write_event_line};
 use crate::core::screenshot::capture::{
-    capture_screen_rgba, crop_rgba, encode_png, find_cursor_monitor, monitor_from_index,
-    MonitorInfo,
+    capture_virtual_region, encode_png, virtual_desktop_bounds, VirtualRegion,
 };
 use crate::error::{AppError, AppResult};
-
-/// User-defined rectangle in monitor-relative pixel coordinates. Origin is the
-/// top-left of the monitor under the cursor at the moment the loop kicks off;
-/// the monitor does NOT re-resolve on each frame (cursor might wander).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Region {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoopCaptureInput {
-    pub region: Region,
+    /// 虚拟桌面绝对坐标下的矩形；可跨屏、x/y 可为负。
+    pub region: VirtualRegion,
     /// Minimum 50 ms; JS-side validation; the Rust side clamps.
     #[serde(default)]
     pub interval_ms: u64,
     /// `None` means run until SIGTERM / max_frames hit externally.
     #[serde(default)]
     pub max_frames: Option<u64>,
-    /// 显示器下标（`Screen::all()` 顺序，由 `select` 输出的 monitorIndex 提供）。
-    /// `None` = 光标所在显示器。显式指定可避免「框选完鼠标挪走」导致的错屏。
-    #[serde(default)]
-    pub monitor: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,32 +164,14 @@ async fn run_loop_inner<W>(input: LoopCaptureInput, writer: &mut W) -> AppResult
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Resolve monitor ONCE. The cursor moving during the loop does not
-    // change which monitor the user originally selected.
-    let cursor_monitor = match input.monitor {
-        Some(index) => tokio::task::spawn_blocking(move || monitor_from_index(index))
-            .await
-            .map_err(|e| AppError::Capture(format!("monitor join error: {e}")))??,
-        None => tokio::task::spawn_blocking(find_cursor_monitor)
-            .await
-            .map_err(|e| AppError::Capture(format!("monitor join error: {e}")))??,
-    };
-    let MonitorInfo {
-        scale_factor: _,
-        x: mon_x,
-        y: mon_y,
-        width: mon_w,
-        height: mon_h,
-    } = cursor_monitor.monitor;
+    // 虚拟桌面并集：用来校验/裁剪 region。光标后续移到哪块屏都不影响。
+    let (ox, oy, dw, dh) = tokio::task::spawn_blocking(virtual_desktop_bounds)
+        .await
+        .map_err(|e| AppError::Capture(format!("bounds join error: {e}")))??;
 
-    let region = clamp_region(&input.region, mon_w, mon_h)?;
+    let region = clamp_region(&input.region, ox, oy, dw, dh)?;
     let interval_ms = input.interval_ms.max(50);
     let max_frames = input.max_frames.unwrap_or(u64::MAX);
-
-    // Wrap in Arcs so the capture task can borrow them across spawn_blocking
-    // calls without moving out of the outer scope.
-    let region = Arc::new(region);
-    let cursor_monitor = Arc::new(cursor_monitor);
 
     // Counters shared between capture task and writer task.
     let frames_emitted = Arc::new(AtomicU64::new(0));
@@ -208,12 +181,12 @@ where
     // Frame channel: bounded mpsc(2). Drop-on-Full.
     let (msg_tx, mut msg_rx) = mpsc::channel::<FrameMsg>(2);
 
-    // Capture task: each iteration captures+crops+encodes via spawn_blocking.
+    // Capture task: each iteration composites + crops + encodes off the async
+    // runtime. On channel-full, drops the frame.
     let frames_emitted_c = frames_emitted.clone();
     let dropped_total_c = dropped_total.clone();
     let stopped_c = stopped.clone();
     let region_c = region.clone();
-    let mon_c = cursor_monitor.clone();
     let capture_handle = tokio::spawn(async move {
         let mut seq: u64 = 0;
         for _ in 0..max_frames {
@@ -221,18 +194,10 @@ where
                 break;
             }
             let captured = {
-                let r = (*region_c).clone();
-                let mon = mon_c.clone(); // Arc::clone, not inner Clone
+                let r = region_c.clone();
                 tokio::task::spawn_blocking(move || -> AppResult<LoopCaptureFrame> {
-                    let (rgba, img_w, img_h) = capture_screen_rgba(&mon)?;
-                    if r.x + r.width > img_w || r.y + r.height > img_h {
-                        return Err(AppError::Capture(format!(
-                            "region out of bounds: {}x{} within {}x{}",
-                            r.width, r.height, img_w, img_h
-                        )));
-                    }
-                    let cropped = crop_rgba(&rgba, img_w, r.x, r.y, r.width, r.height);
-                    let png = encode_png(&cropped, r.width, r.height)?;
+                    let (rgba, w, h) = capture_virtual_region(&r)?;
+                    let png = encode_png(&rgba, w, h)?;
                     let captured_at_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -240,8 +205,8 @@ where
                     Ok(LoopCaptureFrame {
                         seq,
                         captured_at_ms,
-                        width: r.width,
-                        height: r.height,
+                        width: w,
+                        height: h,
                         png_b64: BASE64.encode(&png),
                     })
                 })
@@ -318,10 +283,6 @@ where
         &mut seq_out,
         frames_emitted.clone(),
         dropped_total.clone(),
-        mon_x,
-        mon_y,
-        mon_w,
-        mon_h,
         region_x,
         region_y,
         region_w,
@@ -354,12 +315,8 @@ async fn run_select_loop<W>(
     seq_out: &mut u64,
     frames_emitted: Arc<AtomicU64>,
     dropped_total: Arc<AtomicU64>,
-    mon_x: i32,
-    mon_y: i32,
-    mon_w: u32,
-    mon_h: u32,
-    region_x: u32,
-    region_y: u32,
+    region_x: i32,
+    region_y: i32,
     region_w: u32,
     region_h: u32,
 ) -> AppResult<()>
@@ -380,24 +337,14 @@ where
             maybe_msg = msg_rx.recv() => {
                 let Some(msg) = maybe_msg else { break; };
                 handle_msg(
-                    msg,
-                    writer,
-                    seq_out,
-                    &frames_emitted,
-                    &dropped_total,
-                    mon_x, mon_y, mon_w, mon_h,
+                    msg, writer, seq_out, &frames_emitted, &dropped_total,
                     region_x, region_y, region_w, region_h,
                 ).await?;
             }
             _ = &mut capture_done => {
                 while let Ok(msg) = msg_rx.try_recv() {
                     handle_msg(
-                        msg,
-                        writer,
-                        seq_out,
-                        &frames_emitted,
-                        &dropped_total,
-                        mon_x, mon_y, mon_w, mon_h,
+                        msg, writer, seq_out, &frames_emitted, &dropped_total,
                         region_x, region_y, region_w, region_h,
                     ).await?;
                 }
@@ -418,12 +365,8 @@ async fn run_select_loop<W>(
     seq_out: &mut u64,
     frames_emitted: Arc<AtomicU64>,
     dropped_total: Arc<AtomicU64>,
-    mon_x: i32,
-    mon_y: i32,
-    mon_w: u32,
-    mon_h: u32,
-    region_x: u32,
-    region_y: u32,
+    region_x: i32,
+    region_y: i32,
     region_w: u32,
     region_h: u32,
 ) -> AppResult<()>
@@ -436,24 +379,14 @@ where
             maybe_msg = msg_rx.recv() => {
                 let Some(msg) = maybe_msg else { break; };
                 handle_msg(
-                    msg,
-                    writer,
-                    seq_out,
-                    &frames_emitted,
-                    &dropped_total,
-                    mon_x, mon_y, mon_w, mon_h,
+                    msg, writer, seq_out, &frames_emitted, &dropped_total,
                     region_x, region_y, region_w, region_h,
                 ).await?;
             }
             _ = &mut capture_done => {
                 while let Ok(msg) = msg_rx.try_recv() {
                     handle_msg(
-                        msg,
-                        writer,
-                        seq_out,
-                        &frames_emitted,
-                        &dropped_total,
-                        mon_x, mon_y, mon_w, mon_h,
+                        msg, writer, seq_out, &frames_emitted, &dropped_total,
                         region_x, region_y, region_w, region_h,
                     ).await?;
                 }
@@ -471,12 +404,8 @@ async fn handle_msg<W>(
     seq_out: &mut u64,
     frames_emitted: &Arc<AtomicU64>,
     dropped_total: &Arc<AtomicU64>,
-    mon_x: i32,
-    mon_y: i32,
-    mon_w: u32,
-    mon_h: u32,
-    region_x: u32,
-    region_y: u32,
+    region_x: i32,
+    region_y: i32,
     region_w: u32,
     region_h: u32,
 ) -> AppResult<()>
@@ -493,7 +422,6 @@ where
                 "type": "status",
                 "frames_emitted": frames_emitted.load(Ordering::Relaxed),
                 "dropped_total": dropped_total.load(Ordering::Relaxed),
-                "monitor": { "x": mon_x, "y": mon_y, "width": mon_w, "height": mon_h },
                 "region": { "x": region_x, "y": region_y, "width": region_w, "height": region_h },
             });
             write_event_line(writer, *seq_out, event).await?;
@@ -503,26 +431,29 @@ where
     Ok(())
 }
 
-/// Clamp a region to monitor bounds. Returns `Err` if the resulting region
-/// would be empty or inverted.
+/// 把 region 裁到虚拟桌面并集之内。与并集不相交则报错。
 #[cfg(not(target_os = "macos"))]
-fn clamp_region(input: &Region, mon_w: u32, mon_h: u32) -> AppResult<Region> {
-    let x = input.x.min(mon_w);
-    let y = input.y.min(mon_h);
-    let max_w = mon_w.saturating_sub(x);
-    let max_h = mon_h.saturating_sub(y);
-    let width = input.width.min(max_w);
-    let height = input.height.min(max_h);
-    if width == 0 || height == 0 {
+fn clamp_region(
+    input: &VirtualRegion,
+    ox: i32,
+    oy: i32,
+    dw: u32,
+    dh: u32,
+) -> AppResult<VirtualRegion> {
+    let x1 = input.x.max(ox);
+    let y1 = input.y.max(oy);
+    let x2 = (input.x + input.width as i32).min(ox + dw as i32);
+    let y2 = (input.y + input.height as i32).min(oy + dh as i32);
+    if x2 <= x1 || y2 <= y1 {
         return Err(AppError::Capture(format!(
-            "region has zero size after clamping: {}x{} (monitor {}x{})",
-            width, height, mon_w, mon_h
+            "region ({},{}) {}x{} 与虚拟桌面 ({},{}) {}x{} 不相交",
+            input.x, input.y, input.width, input.height, ox, oy, dw, dh
         )));
     }
-    Ok(Region {
-        x,
-        y,
-        width,
-        height,
+    Ok(VirtualRegion {
+        x: x1,
+        y: y1,
+        width: (x2 - x1) as u32,
+        height: (y2 - y1) as u32,
     })
 }

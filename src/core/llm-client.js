@@ -7,7 +7,10 @@
 
 import { external, badInput } from './errors/index.js';
 
-const DEFAULT_TIMEOUT_MS = 60000;
+// 单次请求超时。给得比较宽：目标模型常是推理模型，一次多模态调用要先把
+// 思维链跑完，实测几十秒很正常。这里不做成配置项——真正需要长等待的用户
+// 会立刻在面板上看到「请求超时」，那时再调这个常量比多一个设置项更直接。
+const DEFAULT_TIMEOUT_MS = 180000;
 
 /**
  * @param {{

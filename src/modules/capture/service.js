@@ -60,7 +60,7 @@ export async function bin() {
  * @param {{region: string, intervalMs: number, maxFrames?: number|null}} opts
  * @returns {Promise<{sessionId: string, startedAt: number, region: object, intervalMs: number, maxFrames: number|null}>}
  */
-export async function start({ region, intervalMs, maxFrames, monitor }) {
+export async function start({ region, intervalMs, maxFrames }) {
   const r = resolveBinary();
   if (!r) {
     if (!isSupported(process.platform, process.arch)) {
@@ -71,23 +71,13 @@ export async function start({ region, intervalMs, maxFrames, monitor }) {
 
   const parsed = parseRegion(region);
   if (!parsed) {
-    throw badInput(`region 格式应为 "x,y,w,h"（非负整数），收到: ${region}`);
-  }
-  if (parsed.width === 0 || parsed.height === 0) {
-    throw badInput(`region 宽高不能为零: ${region}`);
+    throw badInput(
+      `region 格式应为 "x,y,w,h"（整数；x/y 可为负，w/h 必须为正），收到: ${region}`
+    );
   }
   const interval = Number(intervalMs);
   if (!Number.isFinite(interval) || interval < MIN_INTERVAL_MS) {
     throw badInput(`intervalMs 必须 ≥ ${MIN_INTERVAL_MS}（收到: ${intervalMs}）`);
-  }
-  // 框选产出的显示器锚点：缺省 = 光标所在显示器；显式给定则锁定该屏，
-  // 避免「框选完鼠标挪走、循环起在另一块屏」的坐标错位。
-  let monitorIndex = null;
-  if (monitor !== undefined && monitor !== null) {
-    if (!Number.isInteger(Number(monitor)) || Number(monitor) < 0) {
-      throw badInput(`monitor 必须是非负整数（收到: ${monitor}）`);
-    }
-    monitorIndex = Number(monitor);
   }
 
   const session = createSession({
@@ -95,7 +85,6 @@ export async function start({ region, intervalMs, maxFrames, monitor }) {
     intervalMs: interval,
     maxFrames: maxFrames ?? null,
     binPath: r.path,
-    monitor: monitorIndex,
   });
 
   return {
@@ -104,7 +93,6 @@ export async function start({ region, intervalMs, maxFrames, monitor }) {
     region: parsed,
     intervalMs: interval,
     maxFrames: maxFrames ?? null,
-    monitor: monitorIndex,
   };
 }
 
@@ -112,6 +100,8 @@ export async function start({ region, intervalMs, maxFrames, monitor }) {
  * 弹出原生全屏框选蒙版，阻塞到用户完成或取消。
  * 交互时长不可预知：HTTP 调用方（面板）要传足够大的 timeoutMs；CLI 无超时。
  * 服务端 5 分钟兜底：超时杀掉蒙版进程，不让全屏遮罩永远挂着。
+ *
+ * 返回的 region 是**虚拟桌面绝对坐标**，可跨屏，可直接喂给 start()。
  */
 export async function select() {
   const r = resolveBinary();
@@ -130,11 +120,11 @@ export async function select() {
     case 'error':
       throw external(`框选失败: ${out.message}`);
     default: {
-      const { region, monitorIndex } = out;
+      const { region } = out;
       if (region.width === 0 || region.height === 0) {
         throw badInput(`框选区域宽高为零: ${JSON.stringify(region)}`);
       }
-      return { status: 'ok', region, monitorIndex };
+      return { status: 'ok', region };
     }
   }
 }
@@ -154,10 +144,13 @@ export async function list() {
 function parseRegion(s) {
   if (typeof s !== 'string') return null;
   const parts = s.split(',').map((x) => Number(x.trim()));
-  if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n) || n < 0 || !Number.isInteger(n))) {
-    return null;
-  }
-  return { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
+  if (parts.length !== 4 || !parts.every((n) => Number.isInteger(n))) return null;
+  const [x, y, width, height] = parts;
+  // x/y 是虚拟桌面绝对坐标，副屏在主屏左边/上边时为负——不能像以前那样
+  // 卡非负，否则多显示器下左侧那块屏的选区直接被拒。
+  // 宽高必须为正，否则是无意义选区。
+  if (width <= 0 || height <= 0) return null;
+  return { x, y, width, height };
 }
 
 /**

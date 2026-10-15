@@ -5,17 +5,20 @@ import { CliHints } from '../../web/frontend/components/CliHints.jsx';
 // 转录最多保留的气泡数（DOM 上限，防长会话卡顿）。
 const MAX_TURNS = 200;
 
-export function NumInput({ value, onChange, label }) {
+export function NumInput({ value, onChange, label, allowNegative = false }) {
   return (
     <label className="muted" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
       {label}
       <input
         type="number"
-        min={0}
+        min={allowNegative ? undefined : 0}
         className="input"
         style={{ width: 80 }}
         value={value}
-        onChange={(e) => onChange(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+        onChange={(e) => {
+          const n = Math.floor(Number(e.target.value) || 0);
+          onChange(allowNegative ? n : Math.max(0, n));
+        }}
       />
     </label>
   );

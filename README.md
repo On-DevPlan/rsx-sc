@@ -68,27 +68,31 @@ npx rsx-sc settings test
 从 tauri2 的 `capture_window.rs` 移植（`rust/rsx-sc-rust/src/overlay.rs`），
 仍是 winit + softbuffer 直接绘制到原生窗口——没有 WebView，没有白闪：
 
-- 截取光标所在显示器的整屏快照 → 建无边框、置顶、全屏窗口 →
-  **先把压暗的快照画好再显示**（用户看不到白屏）
+- 截取**整个虚拟桌面**（所有显示器的并集）合成一张快照 → 建一个覆盖整个
+  虚拟桌面的无边框置顶窗口 → **先把压暗的快照画好再显示**（无白屏）
 - 拖拽画框：框内还原原始像素、蓝色边框、四角绿色 L 形标记
   （表示「该区域会被循环截屏」）
+- **可以跨屏**：起点在一块屏、终点在另一块屏，选区横跨两块屏
 - 交互约定与主流截屏工具一致：**左键拖拽选中，Esc / 右键取消**
 - Windows 上数位笔 / 触摸屏走 `WM_POINTER`，同样可以拖拽
 
-与 tauri2 的结构差异：tauri2 是常驻 GUI 应用，winit 每进程只允许一个
-EventLoop，所以它用常驻后台线程 + `EventLoopProxy` 派发。本二进制每次
-`select` 都是新进程，事件循环直接归主线程所有，那套 proxy 单例被整个删掉。
+与 tauri2 的结构差异（两处）：一是 tauri2 是常驻 GUI 应用，winit 每进程
+只允许一个 EventLoop，所以它用常驻后台线程 + `EventLoopProxy` 派发；本二进制
+每次 `select` 都是新进程，事件循环直接归主线程，那套 proxy 单例被整个删掉。
+二是 tauri2 在**光标所在那一块屏**上开全屏窗口，选区出不了单屏边界；这里改成
+覆盖整个虚拟桌面的单个窗口——一个 surface、一份合成底图，坐标天然就是虚拟
+桌面绝对坐标，跨屏框选不需要维护多窗口状态。
 
 输出是一行 JSON（不是 Envelope——它是交互式子命令，不是 JSONL 节点）：
 
 ```json
-{"ok":true,"x":399,"y":399,"width":397,"height":205,"monitorIndex":0}
+{"ok":true,"x":-1584,"y":292,"width":1784,"height":296}
 {"ok":true,"cancelled":true}
 ```
 
-`monitorIndex` 会一路带到 `capture.start --monitor <下标>`，让
-`loop_capture` **锁定同一块显示器**——否则框选完鼠标挪到另一块屏，
-循环就会把区域裁到错误的屏幕上。
+`x`/`y` 是**虚拟桌面绝对坐标**，副屏在主屏左边/上边时为负。这个坐标可以直接
+喂给 `capture.start --region`，不需要任何换算——多显示器下这是唯一能表达
+「横跨两块屏的选区」的模型。
 
 `loop_capture` 是新写的节点：`tokio::time::sleep` 提供稳定时基，
 `spawn_blocking` 跑阻塞的 `screenshots::Screen::capture()`，
@@ -130,33 +134,35 @@ Node 层 (`src/core/llm-client.js`)，理由：
 ### 本地构建
 
 ```bash
-cd rust/rsx-sc-rust
-cargo build --release
-mkdir -p ../binaries/win32-x64      # 或当前平台对应的 key
-cp target/release/rsx-sc-rust[.exe] ../binaries/win32-x64/
+cd rust/rsx-sc-rust && cargo build --release
 ```
 
-`binaries/` 在 npm 包的 `files` 中，随主包发布。
+构建产物由 `src/core/rust-binary.js` 的多级解析直接找到
+（`rust/rsx-sc-rust/target/release/`），本地开发不需要往 `binaries/` 放东西。
+
+**二进制不入 git** —— 每次重建约 4.7 MB，进了历史就永久留在每个人的 clone
+里。发布时由 `npm-publish.yml` 从最近一次成功的 `build-rsx-sc-rust` 产物
+下载到 `binaries/<平台>-<架构>/` 再打包；取不到就硬失败，不会发出没有二进制的包。
 
 ### CI（`.github/workflows/`）
 
 - `ci.yml`：每次 push / PR 跑 lint + 单元测试 + 前端构建 + 冒烟。
 - `build-rsx-sc-rust.yml`：矩阵编译（windows-latest + ubuntu-22.04），
-  smoke test 走 Xvfb + JSONL 协议 round-trip；push 到 main 时把新二进制
-  **提交回仓库** `binaries/<key>/`（单包内嵌的前提），tag 触发时另建
-  GitHub Release（资产带平台前缀避免扁平命名冲突）。
-- `npm-publish.yml`：push 到 main → 自动打 tag + `npm publish --provenance`。
+  smoke test 走 Xvfb + JSONL 协议 round-trip，产物作为 artifact 存档
+  （90 天）；tag 触发时另建 GitHub Release（资产带平台前缀避免扁平命名冲突）。
+- `npm-publish.yml`：push 到 main → 打 tag → 从构建产物取二进制 → 发布。
 
 > **版本纪律**：`package.json` 的 `version` 与 `rust/rsx-sc-rust/Cargo.toml`
-> 手工保持一致。由于二进制要先进仓库、`npm publish` 才拿得到，**改 Rust 与
-> bump 版本不要放在同一次 push**——先 push Rust 改动等 build 把二进制提交回来，
-> 再 bump 版本触发发布。
+> 手工保持一致。改 Rust 与 bump 版本最好分两次 push——同一次 push 时
+> build 可能还没跑完，发布取到的是上一次的产物。
 
 ## 局限（v1）
 
 - macOS 不支持（Rust 端返回 "v1 仅支持 Windows / Linux" 错误 envelope）。
 - `select` 蒙版需要**图形界面**：无显示的服务器/容器里会报错，此时用
   `--region` 显式给坐标。
+- `--region` 用**虚拟桌面绝对坐标**（副屏在主屏左边时为负值），与 `select`
+  的输出同一坐标系。
 - 仅随包分发 x64（win32-x64 / linux-x64）。
 - 仅 OpenAI 兼容的 chat/completions；流式响应未启用。
 - LLM 调用是「单串行」（一次只发一个 in-flight 请求），并发截屏高 interval

@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 /**
  * @param {{binPath: string, timeoutMs?: number}} opts
  * @returns {Promise<
- *   | {status: 'ok', region: {x:number,y:number,width:number,height:number}, monitorIndex: number|null}
+ *   | {status: 'ok', region: {x:number,y:number,width:number,height:number}}
  *   | {status: 'cancelled'}
  *   | {status: 'timeout'}
  *   | {status: 'error', message: string}
@@ -73,10 +73,10 @@ export function runSelection({ binPath, timeoutMs = 5 * 60_000 }) {
         return;
       }
       if (j.ok && [j.x, j.y, j.width, j.height].every((n) => typeof n === 'number')) {
+        // x/y 是虚拟桌面绝对坐标（副屏在主屏左侧时为负），可跨屏。
         finish({
           status: 'ok',
           region: { x: j.x, y: j.y, width: j.width, height: j.height },
-          monitorIndex: typeof j.monitorIndex === 'number' ? j.monitorIndex : null,
         });
         return;
       }

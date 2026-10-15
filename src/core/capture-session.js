@@ -27,7 +27,7 @@ const SESSIONS = new Map();
 
 /**
  * Start a new capture session.
- * @param {{region: {x:number,y:number,width:number,height:number}, intervalMs: number, maxFrames?: number|null, binPath: string, monitor?: number|null}} opts
+ * @param {{region: {x:number,y:number,width:number,height:number}, intervalMs: number, maxFrames?: number|null, binPath: string}} opts
  * @returns {SessionEntry}
  */
 export function createSession(opts) {
@@ -44,7 +44,6 @@ export function createSession(opts) {
     region: opts.region,
     intervalMs: opts.intervalMs,
     maxFrames: opts.maxFrames ?? null,
-    monitor: opts.monitor ?? null,
     binPath: opts.binPath,
     client,
     emitter,
@@ -88,7 +87,6 @@ export function createSession(opts) {
       region: opts.region,
       intervalMs: opts.intervalMs,
       maxFrames: opts.maxFrames ?? undefined,
-      monitor: opts.monitor ?? undefined,
     })
     .catch((err) => {
       entry.stats.lastError = String(err?.message || err);
@@ -112,7 +110,6 @@ export function listSessions() {
       region: e.region,
       intervalMs: e.intervalMs,
       maxFrames: e.maxFrames,
-      monitor: e.monitor,
       binPath: e.binPath,
       status: e.stats.ended ? 'ended' : 'running',
       frames: e.stats.frames,

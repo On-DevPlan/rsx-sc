@@ -25,33 +25,31 @@ export default {
       id: 'capture.start',
       cli: ['capture', 'start'],
       http: ['POST', '/api/capture/start'],
-      summary: '开始一个截屏会话',
+      summary: '开始一个截屏会话（region 为虚拟桌面绝对坐标）',
       flags: {
-        region: { type: 'string', default: '0,0,800,600' },
+        region: { type: 'string', default: '0,0,800,600', hint: 'x,y,w,h' },
         intervalMs: { type: 'number', default: 500 },
         maxFrames: { type: 'number', default: null },
-        monitor: { type: 'number', default: null, hint: '显示器下标' },
       },
       run: async (ctx) => {
         return service.start({
           region: ctx.region,
           intervalMs: ctx.intervalMs,
           maxFrames: ctx.maxFrames,
-          monitor: ctx.monitor,
         });
       },
-      render: (r) => `session: ${r.sessionId}\n  region=${JSON.stringify(r.region)}  intervalMs=${r.intervalMs}  maxFrames=${r.maxFrames ?? '∞'}  monitor=${r.monitor ?? '光标所在屏'}`,
+      render: (r) => `session: ${r.sessionId}\n  region=${JSON.stringify(r.region)}  intervalMs=${r.intervalMs}  maxFrames=${r.maxFrames ?? '∞'}`,
     },
     {
       id: 'capture.select',
       cli: ['capture', 'select'],
       http: ['POST', '/api/capture/select'],
-      summary: '弹出原生全屏蒙版，鼠标框选一个区域（Esc/右键取消）',
+      summary: '弹出原生蒙版（铺满所有显示器），鼠标框选一个区域（Esc/右键取消）',
       run: () => service.select(),
       render: (r) =>
         r.status === 'cancelled'
           ? '已取消（未框选区域）'
-          : `已框选: ${JSON.stringify(r.region)}（显示器 ${r.monitorIndex}）`,
+          : `已框选: ${JSON.stringify(r.region)}（虚拟桌面绝对坐标，可跨屏）`,
     },
     {
       id: 'capture.stop',

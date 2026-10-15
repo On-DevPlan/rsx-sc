@@ -1,9 +1,14 @@
 //! `select` 子命令 — 原生全屏框选蒙版（从 tauri2 的 capture_window.rs 移植）。
 //!
-//! 流程：截取光标所在显示器的整屏快照 → 建一个无边框、置顶、全屏的窗口，
-//! 先画好「压暗的快照」再显示（无白闪）→ 用户拖拽画框（框内还原原始像素、
-//! 蓝色边框、四角绿色 L 形标记表示「该区域将被循环截屏」）→ 松开鼠标输出
-//! 选中矩形的显示器相对坐标 → 进程退出。
+//! 流程：把**整个虚拟桌面**（所有显示器的并集）截成一张合成快照 → 建一个
+//! 覆盖整个虚拟桌面的无边框置顶窗口，先画好「压暗的快照」再显示（无白闪）
+//! → 用户拖拽画框（框内还原原始像素、蓝色边框、四角绿色 L 形标记表示
+//! 「该区域将被循环截屏」）→ 松开鼠标输出选中矩形的**虚拟桌面绝对坐标** →
+//! 进程退出。
+//!
+//! 坐标系：结果是虚拟桌面绝对坐标（origin = 并集左上角，副屏在主屏左边时
+//! x 为负），**可以跨屏**。这是多显示器下唯一能表达「横跨两块屏的选区」的
+//! 模型；`loop_capture` 也按同一坐标系逐屏拼接。
 //!
 //! 交互（与 tauri2 及所有主流截屏工具一致）：
 //!   * 左键拖拽   选中
@@ -13,12 +18,14 @@
 //! 与 tauri2 的结构差异：tauri2 是常驻 GUI 应用，winit 每进程只允许一个
 //! EventLoop，所以它用常驻后台线程 + `EventLoopProxy` 派发 StartCapture。
 //! 本二进制每次 `select` 都是一个新进程，事件循环可以直接归主线程所有，
-//! 于是那套 proxy 单例被整个删掉——快照在进事件循环之前截好，窗口在
-//! `resumed()` 里打开，结果通过 mpsc 带出来。
+//! 于是那套 proxy 单例被整个删掉。
+//!
+//! 另一个差异：tauri2 在**光标所在的那一块屏**上开全屏窗口，因此选区出不了
+//! 单屏边界。这里改成覆盖整个虚拟桌面的单个窗口——一个 surface、一份合成
+//! 底图、坐标天然就是虚拟桌面绝对坐标，跨屏框选不需要维护多窗口状态。
 //!
 //! 输出协议（stdout，单行 JSON）：
-//!   选中   {"ok":true,"x":..,"y":..,"width":..,"height":..,"monitorIndex":N,
-//!           "monitor":{"x":..,"y":..,"width":..,"height":..,"scaleFactor":..}}
+//!   选中   {"ok":true,"x":..,"y":..,"width":..,"height":..}
 //!   取消   {"ok":true,"cancelled":true}
 //!   出错   stderr 文本 + 退出码 1（由 main 统一打印）
 
@@ -27,14 +34,12 @@ use std::sync::mpsc;
 
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::window::{Fullscreen, Window, WindowLevel};
+use winit::window::{Window, WindowLevel};
 
-use crate::core::screenshot::capture::{
-    capture_screen_rgba, find_cursor_monitor_indexed,
-};
+use crate::core::screenshot::capture::capture_virtual_desktop;
 use crate::error::AppResult;
 
 // ── Loop-mode corner marker tunables（与 tauri2 相同）────────────────────────
@@ -46,14 +51,13 @@ const LOOP_MARKER_ARM: u32 = 24; // arm length in px
 const LOOP_MARKER_THICKNESS: u32 = 4; // line width in px
 const SELECTION_BORDER_COLOR: u32 = 0x004A9EFF; // blue border
 
-/// 选中矩形，显示器相对物理像素坐标（与 `loop_capture` 的 region 同一坐标系）。
+/// 选中矩形，**虚拟桌面绝对坐标**（与 `loop_capture` 的 region 同一坐标系）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Selection {
-    pub x: u32,
-    pub y: u32,
+    pub x: i32,
+    pub y: i32,
     pub width: u32,
     pub height: u32,
-    pub monitor_index: usize,
 }
 
 enum OverlayEvent {
@@ -63,16 +67,12 @@ enum OverlayEvent {
 
 /// 子进程入口：`rsx-sc-rust select`。
 pub async fn run() -> AppResult<()> {
-    // 1. 先截快照（阻塞调用，丢进 blocking 线程），再进事件循环。
+    // 1. 先截整块虚拟桌面（阻塞调用，丢进 blocking 线程），再进事件循环。
     //    block_on 跑在主线程上，因此 winit 在 macOS 上也满足「主线程」约束。
-    let (rgba, img_w, img_h, monitor, monitor_index) =
-        tokio::task::spawn_blocking(|| -> AppResult<_> {
-            let (mon, idx) = find_cursor_monitor_indexed()?;
-            let (rgba, w, h) = capture_screen_rgba(&mon)?;
-            Ok((rgba, w, h, mon.monitor, idx))
-        })
-        .await
-        .map_err(|e| crate::error::AppError::Capture(format!("capture join error: {e}")))??;
+    let (rgba, img_w, img_h, origin_x, origin_y) =
+        tokio::task::spawn_blocking(capture_virtual_desktop)
+            .await
+            .map_err(|e| crate::error::AppError::Capture(format!("capture join error: {e}")))??;
 
     // 2. 事件循环。结果经 mpsc 带出。
     let (tx, rx) = mpsc::channel::<OverlayEvent>();
@@ -105,13 +105,13 @@ pub async fn run() -> AppResult<()> {
             rgba,
             img_w,
             img_h,
-            monitor_x: monitor.x,
-            monitor_y: monitor.y,
-            monitor_index,
+            origin_x,
+            origin_y,
         }),
         session: None,
         _ctx_storage: None,
         result_tx: tx,
+        origin: (origin_x, origin_y),
     };
     let _ = event_loop.run_app(&mut app);
 
@@ -126,7 +126,6 @@ pub async fn run() -> AppResult<()> {
                     "y": sel.y,
                     "width": sel.width,
                     "height": sel.height,
-                    "monitorIndex": sel.monitor_index,
                 })
             );
         }
@@ -150,9 +149,9 @@ struct StartParams {
     rgba: Vec<u8>,
     img_w: u32,
     img_h: u32,
-    monitor_x: i32,
-    monitor_y: i32,
-    monitor_index: usize,
+    /// 虚拟桌面并集左上角——窗口摆在这个位置，选区加上它就得到绝对坐标。
+    origin_x: i32,
+    origin_y: i32,
 }
 
 struct CaptureSession {
@@ -176,26 +175,33 @@ struct SelectApp {
     // softbuffer 的 Context 必须活到 Surface 之后，单放一份保命。
     _ctx_storage: Option<Context<std::sync::Arc<Window>>>,
     result_tx: mpsc::Sender<OverlayEvent>,
+    origin: (i32, i32),
 }
 
 impl SelectApp {
     fn open_window(&mut self, event_loop: &ActiveEventLoop, p: StartParams) {
-        // 按显示器坐标找到对应的物理显示器，全屏到那一块。
-        let target_monitor = event_loop
-            .available_monitors()
-            .find(|m| m.position().x == p.monitor_x && m.position().y == p.monitor_y);
-        let fullscreen = match target_monitor {
-            Some(m) => Fullscreen::Borderless(Some(m)),
-            None => Fullscreen::Borderless(None),
-        };
+        self.origin = (p.origin_x, p.origin_y);
 
-        let attrs = Window::default_attributes()
+        // 覆盖整个虚拟桌面：摆在并集左上角、尺寸为并集大小。
+        // 不用 Fullscreen —— 那是「一块显示器」，跨屏选区会出不去。
+        // 无边框 + 置顶 + 按物理像素定尺寸，渲染即 1:1 映射到屏幕物理像素。
+        // X11：绕过窗口管理器，免得它把「比单块屏还大」的窗口挪位/裁掉。
+        // 非 Unix 平台不会改写 attrs，所以 Windows 上 `mut` 是无用的。
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title("rsx-sc select")
             .with_decorations(false)
             .with_resizable(false)
-            .with_fullscreen(Some(fullscreen))
+            .with_position(PhysicalPosition::new(p.origin_x, p.origin_y))
+            .with_inner_size(PhysicalSize::new(p.img_w, p.img_h))
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_visible(false);
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs = attrs.with_override_redirect(true);
+        }
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => std::sync::Arc::new(w),
@@ -271,7 +277,7 @@ impl SelectApp {
     /// 结束拖拽。真正拖出了矩形（>4px）就算选中；否则视为取消——
     /// 单次轻点不该把用户困在蒙版里。
     fn handle_drag_release(&mut self, event_loop: &ActiveEventLoop) {
-        let selection = if let Some(session) = &mut self.session {
+        let local = if let Some(session) = &mut self.session {
             if session.is_dragging {
                 if let Some(start) = session.drag_start {
                     session.selection = Some(normalize_rect(start, session.mouse_pos));
@@ -288,18 +294,17 @@ impl SelectApp {
             None
         };
 
-        match selection {
-            Some((x, y, w, h)) => {
-                let monitor_index = self
-                    .start
-                    .as_ref()
-                    .map(|p| p.monitor_index)
-                    .unwrap_or(0);
-                self.finish(
-                    event_loop,
-                    OverlayEvent::Selected(Selection { x, y, width: w, height: h, monitor_index }),
-                );
-            }
+        match local {
+            // 窗口坐标 → 虚拟桌面绝对坐标
+            Some((x, y, w, h)) => self.finish(
+                event_loop,
+                OverlayEvent::Selected(Selection {
+                    x: self.origin.0 + x as i32,
+                    y: self.origin.1 + y as i32,
+                    width: w,
+                    height: h,
+                }),
+            ),
             None => self.finish(event_loop, OverlayEvent::Cancelled),
         }
     }

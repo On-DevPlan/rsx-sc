@@ -71,12 +71,13 @@ export default {
         const r = await store.readSettings();
         const t0 = Date.now();
         try {
+          // 不要设 maxTokens：推理模型（如 deepseek-v4.x）会先把预算花在思维链上，
+          // 卡得太紧会导致 content 为空——表现为「模型明明通了却报返回空内容」。
           const out = await llm.chatCompletion({
             apiBase: r.settings.apiBase,
             apiKey: r.settings.apiKey,
             model: r.settings.model,
             messages: [{ role: 'user', content: 'Reply with the single word: pong' }],
-            maxTokens: 8,
             temperature: 0,
           });
           return {
