@@ -14,8 +14,11 @@ rust/**/target/
 # GH Actions dist/ output
 dist/
 
-# 单包内嵌：二进制随主包发布，必须入库（npm publish 从 checkout 读）。
-# CI（build-rsx-sc-rust.yml）编译后会把新二进制提交回来。
+# 二进制不入库（每个 ~4.7 MB，进了历史就永久留在 clone 里）。
+# 发布时由 npm-publish.yml 从 CI 构建产物下载到 binaries/ 再打包；
+# 本地开发由 src/core/rust-binary.js 回退到 rust/rsx-sc-rust/target/release/。
+# .gitkeep 保留目录骨架，好让 package.json 的 files 白名单有个真实落点。
+binaries/*
 !binaries/.gitkeep
 
 # ============================================================

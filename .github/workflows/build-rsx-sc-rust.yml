@@ -1,10 +1,10 @@
 # 多平台编译 Rust 截屏引擎，产出可直接分发的静态二进制。
 #
-# 分发形态是**单包内嵌**（参考 gh-action/A06）：二进制既随 npm 主包发布，
-# 也作为 GitHub Release 资产单独提供。因此本工作流要做两件事：
-#   1. push 到 main 时，把编译产物**提交回仓库**的 binaries/<platform>-<arch>/
-#      —— npm publish 从 checkout 读仓库内容，二进制必须先入库；
-#   2. 打 tag 时，汇总各平台产物创建 Release（资产带平台前缀避免扁平命名冲突）。
+# 分发形态是**单包内嵌**（参考 gh-action/A06）：二进制随 npm 主包发布。
+# 但二进制**不入 git** —— 每次重建约 4.7 MB，进了历史就永久留在每个人的
+# clone 里。改成本工作流只产出 artifact，由 npm-publish.yml 在发布前下载：
+#   * push 到 main：编译 + 冒烟，产物作为 artifact 存档；
+#   * 打 tag：另建 GitHub Release，资产带平台前缀避免扁平命名冲突。
 #
 # 产物目录结构（与 src/core/rust-binary.js 的查找路径一致）：
 #   binaries/win32-x64/rsx-sc-rust.exe
@@ -28,12 +28,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write    # 提交二进制回仓库 + 打 Release 都需要
-
-# 两个 matrix job 会并发 push 回 main，串行化避免 non-fast-forward 互相打架。
-concurrency:
-  group: build-rsx-sc-rust-${{ github.ref }}
-  cancel-in-progress: false
+  contents: write    # 打 Release 需要
 
 env:
   CARGO_TERM_COLOR: always
@@ -150,43 +145,13 @@ jobs:
             exit 1
           fi
 
-      # 单包内嵌的关键一步：二进制必须入库，npm publish 才能拿到它。
-      # GITHUB_TOKEN 的 push 不会触发下游 workflow（GitHub 防递归），
-      # 所以这里不能指望「提交完自动带起发布」——发布由 push 到 main 触发。
-      - name: 提交二进制回仓库
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          DEST="binaries/${{ matrix.artifact }}/${{ matrix.binary }}"
-          mkdir -p "$(dirname "$DEST")"
-          cp "dist/${{ matrix.artifact }}/${{ matrix.binary }}" "$DEST"
-          git add "$DEST"
-          if git diff --cached --quiet; then
-            echo "binary unchanged"
-            exit 0
-          fi
-          git commit -m "chore(binary): update ${{ matrix.artifact }}/${{ matrix.binary }}"
-          # 另一个 matrix job 可能刚推过，rebase 后重试
-          for i in 1 2 3 4 5; do
-            if git pull --rebase origin main && git push; then
-              echo "pushed"
-              exit 0
-            fi
-            echo "push attempt $i failed, retrying..."
-            sleep 3
-          done
-          echo "::error::三次重试后仍无法推送二进制"
-          exit 1
-
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
         with:
           name: rsx-sc-rust-${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}/
           if-no-files-found: error
+          retention-days: 90
 
   # 打 tag 时汇总所有平台产物并创建 Release
   release:

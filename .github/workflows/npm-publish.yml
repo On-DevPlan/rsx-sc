@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write   # 打 tag 需要
   id-token: write   # --provenance 签名需要（OIDC）
+  actions: read     # 下载 build-rsx-sc-rust 的产物需要
 
 jobs:
   publish:
@@ -58,6 +59,38 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.pkg.outputs.tag }}" -m "Release ${{ steps.pkg.outputs.tag }}"
           git push origin "${{ steps.pkg.outputs.tag }}"
+
+      # 二进制不入 git（每个 ~4.7 MB），发布前从最近一次成功的 Rust 构建
+      # 产物里取回来。取不到就硬失败——发一个没有二进制的包比不发更糟。
+      #
+      # 时序注意：若「改 Rust」与「bump 版本」在同一次 push 里，build 可能还没
+      # 跑完，这里取到的是上一次的产物。发版时把两者分开推即可。
+      - name: 取构建产物里的二进制
+        if: steps.check.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow build-rsx-sc-rust --branch main --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::找不到成功的 build-rsx-sc-rust 运行，无法取得二进制"
+            exit 1
+          fi
+          echo "使用构建 run: $RUN_ID"
+          rm -rf /tmp/art
+          for KEY in win32-x64 linux-x64; do
+            BIN=rsx-sc-rust
+            [ "$KEY" = "win32-x64" ] && BIN=rsx-sc-rust.exe
+            gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "rsx-sc-rust-$KEY" --dir "/tmp/art/$KEY"
+            mkdir -p "binaries/$KEY"
+            cp "/tmp/art/$KEY/$BIN" "binaries/$KEY/$BIN"
+            chmod +x "binaries/$KEY/$BIN"
+          done
+          echo "--- 待打包的 binaries/ ---"
+          ls -lh binaries/*/
 
       - name: 发布
         if: steps.check.outputs.published == 'false'
