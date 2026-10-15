@@ -62,9 +62,6 @@ jobs:
 
       # 二进制不入 git（每个 ~4.7 MB），发布前从最近一次成功的 Rust 构建
       # 产物里取回来。取不到就硬失败——发一个没有二进制的包比不发更糟。
-      #
-      # 时序注意：若「改 Rust」与「bump 版本」在同一次 push 里，build 可能还没
-      # 跑完，这里取到的是上一次的产物。发版时把两者分开推即可。
       - name: 取构建产物里的二进制
         if: steps.check.outputs.published == 'false'
         env:
@@ -78,7 +75,22 @@ jobs:
             echo "::error::找不到成功的 build-rsx-sc-rust 运行，无法取得二进制"
             exit 1
           fi
-          echo "使用构建 run: $RUN_ID"
+
+          # 过期闸门：产物必须对应当前 rust/ 源码。
+          # publish 与 build 都由 push 触发，两者并发时 publish 取到的是**上一次**
+          # 构建的产物 —— 那样发出去的包 JS 是新的、二进制是旧的，而 region
+          # 的坐标语义在 0.4.0 变过，这种错配会静默产生错误截图。
+          # 判据是「产物来源提交之后 rust/ 有没有再改动」：纯 JS 发版 rust/ 不变，
+          # 闸门放行；改了 Rust 却没过 build，则明确拒绝。
+          BUILD_SHA=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json headSha --jq .headSha)
+          if ! git diff --quiet "$BUILD_SHA" HEAD -- rust/; then
+            echo "::error::产物来自 ${BUILD_SHA}，之后 rust/ 又有改动，二进制已过期，拒绝发布。"
+            echo "::error::等 build-rsx-sc-rust 跑完后重新触发发布（push 一个空提交或重跑本 workflow）。"
+            exit 1
+          fi
+          echo "使用构建 run: $RUN_ID (来源 $BUILD_SHA)"
+
           rm -rf /tmp/art
           for KEY in win32-x64 linux-x64; do
             BIN=rsx-sc-rust
