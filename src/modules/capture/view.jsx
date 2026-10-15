@@ -9,11 +9,14 @@ export default function CaptureView() {
   const toast = useToast();
   const [bin, setBin] = useState(null);
   const [region, setRegion] = useState({ x: 0, y: 0, w: 800, h: 600 });
-  const [intervalMs, setIntervalMs] = useState(500);
+  const [minIntervalMs, setMinIntervalMs] = useState(0);
   const [maxFrames, setMaxFrames] = useState('');
   const [sessionId, setSessionId] = useState(null);
   const [stats, setStats] = useState(null);
   const [picking, setPicking] = useState(false);
+  // 采集已结束但流还开着——等最后一次 LLM 回复落地。
+  const [ended, setEnded] = useState(false);
+  const idleTimerRef = useRef(null);
   const [turns, setTurns] = useState([]); // {role, payload, ts}
   const [note, setNote] = useState('');
   const esRef = useRef(null);
@@ -52,6 +55,20 @@ export default function CaptureView() {
     const url = `/api/capture/stream/${encodeURIComponent(sessionId)}`;
     const es = new EventSource(url);
     esRef.current = es;
+    const closeStream = () => {
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+      try { es.close(); } catch {}
+      esRef.current = null;
+      setEnded(false);
+      setSessionId(null);
+    };
+    // 看门狗：采集结束后流不立刻关（最后一次 LLM 回复可能还在路上），
+    // 改成「多久没新事件就关」。采集进行中帧不断，看门狗永远不触发。
+    const armIdleClose = () => {
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = setTimeout(closeStream, 30000);
+    };
     es.onmessage = (ev) => {
       let msg;
       try {
@@ -59,10 +76,40 @@ export default function CaptureView() {
       } catch {
         return;
       }
+      armIdleClose();
       if (msg.type === 'frame') {
         if (seenRef.current.has(msg.seq)) return;
         seenRef.current.add(msg.seq);
         setTurns((t) => trim([...t, { role: 'frame', payload: msg, ts: Date.now() }]));
+      } else if (msg.type === 'llm_start') {
+        // 先立一个空气泡，随后的 delta 往里追加 —— 用户立刻看到「在回复」
+        setTurns((t) =>
+          trim([...t, { role: 'assistant', payload: { seq: msg.seq, content: '', done: false }, ts: Date.now() }])
+        );
+      } else if (msg.type === 'llm_delta') {
+        setTurns((t) =>
+          t.map((x) =>
+            x.role === 'assistant' && x.payload.seq === msg.seq && !x.payload.done
+              ? { ...x, payload: { ...x.payload, content: x.payload.content + msg.text } }
+              : x
+          )
+        );
+      } else if (msg.type === 'llm_end') {
+        // 以完整文本为准（流式增量可能因断线丢尾）
+        setTurns((t) =>
+          t.map((x) =>
+            x.role === 'assistant' && x.payload.seq === msg.seq
+              ? { ...x, payload: { seq: msg.seq, content: msg.content, done: true } }
+              : x
+          )
+        );
+      } else if (msg.type === 'llm_error') {
+        setTurns((t) =>
+          trim([
+            ...t,
+            { role: 'llm_error', payload: { seq: msg.seq, error: msg.error, code: msg.code }, ts: Date.now() },
+          ])
+        );
       } else if (msg.type === 'status') {
         setStats((s) =>
           s
@@ -73,17 +120,17 @@ export default function CaptureView() {
         setStats((s) => (s ? { ...s, frames: msg.frames ?? s.frames, dropped: msg.dropped ?? s.dropped, status: 'ended' } : s));
         toast(`循环结束：${msg.frames} 帧，丢失 ${msg.dropped}`);
       } else if (msg.type === 'end') {
-        es.close();
-        esRef.current = null;
-        if (sessionId) setSessionId(null);
+        // 采集结束，但可能还有一次 LLM 回复在路上 → 不关流，交给看门狗。
+        setEnded(true);
+      } else if (msg.type === 'close') {
+        closeStream();
       } else if (msg.type === 'error') {
         toast(`错误: ${msg.message}`);
       }
     };
-    es.onerror = () => {
-      // EventSource will auto-reconnect; don't toast unless it's a hard close
-    };
     return () => {
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
       try { es.close(); } catch {}
       esRef.current = null;
     };
@@ -114,26 +161,26 @@ export default function CaptureView() {
         method: 'POST',
         body: {
           region: `${region.x},${region.y},${region.w},${region.h}`,
-          intervalMs,
+          minIntervalMs,
           maxFrames: maxFrames ? Number(maxFrames) : null,
         },
       });
       setTurns([]);
       setStats({ ...out, status: 'running', frames: 0, dropped: 0 });
       setSessionId(out.sessionId);
+      setEnded(false);
       toast('已开始');
     } catch (e) {
       toast(String(e.message || e));
     }
-  }, [region, intervalMs, maxFrames, toast]);
+  }, [region, minIntervalMs, maxFrames, toast]);
 
   const stop = useCallback(async () => {
     if (!sessionId) return;
     try {
       await api('/api/capture/stop', { method: 'POST', body: { sessionId } });
-      try { esRef.current?.close(); } catch {}
-      esRef.current = null;
-      setSessionId(null);
+      // 不立刻关流：停止同样可能还有一次回复在路上，交给看门狗收尾
+      setEnded(true);
     } catch (e) {
       toast(String(e.message || e));
     }
@@ -164,7 +211,7 @@ export default function CaptureView() {
             <button
               className="btn ghost"
               onClick={pick}
-              disabled={!bin?.found || picking || !!sessionId}
+              disabled={!bin?.found || picking || (!!sessionId && !ended)}
               title="弹出原生蒙版（铺满所有显示器，可跨屏拖拽）；Esc 或右键取消"
             >
               {picking ? '等待框选…' : '框选区域'}
@@ -172,18 +219,20 @@ export default function CaptureView() {
           </div>
         </div>
         <div className="row">
-          <div className="name">间隔 (ms)</div>
+          <div className="name">最小间隔 (ms)</div>
           <div className="desc">
             <input
               type="number"
-              min={50}
+              min={0}
               step={50}
               className="input"
               style={{ width: 120 }}
-              value={intervalMs}
-              onChange={(e) => setIntervalMs(Number(e.target.value) || 500)}
+              value={minIntervalMs}
+              onChange={(e) => setMinIntervalMs(Math.max(0, Number(e.target.value) || 0))}
             />
-            <span className="muted" style={{ marginLeft: 8 }}>≥ 50</span>
+            <span className="muted" style={{ marginLeft: 8 }}>
+              只是兜底；实际节奏是「等这一帧的模型回复落地，再截下一张」
+            </span>
           </div>
         </div>
         <div className="row">
@@ -203,10 +252,12 @@ export default function CaptureView() {
         </div>
         <div className="row">
           <div className="desc muted">
-            {stats ? `已捕获 ${stats.frames} 帧 · 丢失 ${stats.dropped} 帧 · session ${stats.sessionId?.slice(0, 8)}…` : '未启动'}
+            {stats
+              ? `已捕获 ${stats.frames} 帧 · 丢失 ${stats.dropped} 帧 · session ${stats.sessionId?.slice(0, 8)}…${ended ? ' · 采集已结束，等待最后一条回复…' : ''}`
+              : '未启动'}
           </div>
           <div className="acts">
-            {sessionId ? (
+            {sessionId && !ended ? (
               <button className="btn danger" onClick={stop}>停止</button>
             ) : (
               <button className="btn" onClick={start} disabled={!bin?.found}>开始</button>

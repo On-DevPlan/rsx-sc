@@ -1,9 +1,22 @@
-//! `capture` node — BitBlt the monitor under the cursor, encode as PNG (one-shot).
+//! 像素级截屏原语 + `capture` 节点。
 //!
-//! Reuses the same primitives as `loop_capture`: `find_cursor_monitor`,
-//! `capture_screen_rgba`, `crop_rgba`, `encode_png`. The one-shot node is
-//! kept around for diagnostic use (e.g. `echo '{"type":"frame","seq":0,"payload":{}}'
-//! | rsx-sc-rust capture` from the shell).
+//! ## 坐标系：虚拟桌面绝对坐标
+//!
+//! 所有区域都是**虚拟桌面绝对坐标**——原点 = 所有显示器并集的左上角，副屏在
+//! 主屏左边/上边时 x/y 为负，且可以跨屏。这是多显示器下唯一能表达「横跨两块
+//! 屏的选区」的模型，`select`（框选蒙版）输出的也正是这个坐标系。
+//!
+//! ## 为什么没有「光标所在显示器」那套
+//!
+//! 早期移植自 tauri2 的版本按「光标所在显示器」定位、region 用显示器相对坐标。
+//! 那套模型在多显示器下有根本缺陷（选区出不了单屏、跨屏无法表达），已整体
+//! 换成虚拟桌面坐标，光标/显示器枚举相关的代码随之删除。
+//!
+//! ## 节点
+//!
+//! - **`capture`** — 截一帧。输入可带 `region`（虚拟桌面坐标）；缺省截整块
+//!   虚拟桌面。这是面板「顺序驱动」流程的基本操作：截一张 → 交给模型 → 等回复
+//!   → 再截下一张。
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -13,28 +26,10 @@ use serde::{Deserialize, Serialize};
 use crate::core::node::{run_node_stdio, Node};
 use crate::error::{AppError, AppResult};
 
-// ── Raw pixel primitives (ported from tauri2) ────────────────────────────────
+// ── 虚拟桌面坐标下的矩形 ────────────────────────────────────────────────────
 
-#[cfg(not(target_os = "macos"))]
-pub struct MonitorInfo {
-    pub scale_factor: f64,
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-
-#[cfg(not(target_os = "macos"))]
-pub struct CursorMonitor {
-    pub screen: screenshots::Screen,
-    pub monitor: MonitorInfo,
-}
-
-/// 虚拟桌面坐标下的矩形。
-///
 /// 原点 = 所有显示器并集的左上角，**允许负坐标**（副屏在主屏左边时 x 为负），
-/// 且可以**跨屏**——这是多显示器下唯一能表达「横跨两块屏的选区」的坐标系。
-/// 显示器之间的空隙在输出里留黑。
+/// 且可以**跨屏**。显示器之间的空隙在输出里留黑。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VirtualRegion {
@@ -43,6 +38,30 @@ pub struct VirtualRegion {
     pub width: u32,
     pub height: u32,
 }
+
+// ── macOS stubs ─────────────────────────────────────────────────────────────
+//
+// v1 不支持 macOS。Node 层会先按平台报错；这里保证直接跑二进制时也有清晰错误。
+
+#[cfg(target_os = "macos")]
+const MACOS_STUB: &str = "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)";
+
+#[cfg(target_os = "macos")]
+pub fn virtual_desktop_bounds() -> AppResult<(i32, i32, u32, u32)> {
+    Err(AppError::Capture(MACOS_STUB.into()))
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_virtual_region(_r: &VirtualRegion) -> AppResult<(Vec<u8>, u32, u32)> {
+    Err(AppError::Capture(MACOS_STUB.into()))
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_virtual_desktop() -> AppResult<(Vec<u8>, u32, u32, i32, i32)> {
+    Err(AppError::Capture(MACOS_STUB.into()))
+}
+
+// ── 虚拟桌面：边界与抓取（Windows / Linux）──────────────────────────────────
 
 /// 所有显示器并集的包围盒（虚拟桌面），返回 (x, y, width, height)。
 #[cfg(not(target_os = "macos"))]
@@ -130,7 +149,7 @@ pub fn capture_virtual_region(r: &VirtualRegion) -> AppResult<(Vec<u8>, u32, u32
     Ok((out, r.width, r.height))
 }
 
-/// 把整个虚拟桌面截下来（供框选蒙版当底图）。
+/// 把整个虚拟桌面截下来（供框选蒙版当底图，也可作 capture 的缺省范围）。
 /// 返回 (rgba, width, height, origin_x, origin_y)。
 #[cfg(not(target_os = "macos"))]
 pub fn capture_virtual_desktop() -> AppResult<(Vec<u8>, u32, u32, i32, i32)> {
@@ -144,113 +163,7 @@ pub fn capture_virtual_desktop() -> AppResult<(Vec<u8>, u32, u32, i32, i32)> {
     Ok((rgba, rw, rh, ox, oy))
 }
 
-/// Find the monitor under the cursor (Windows / Linux).
-#[cfg(not(target_os = "macos"))]
-pub fn find_cursor_monitor() -> AppResult<CursorMonitor> {
-    let (cursor_x, cursor_y) = cursor_position()?;
-    let screen = screenshots::Screen::from_point(cursor_x, cursor_y)
-        .map_err(|e| AppError::Capture(format!("no screen at ({cursor_x},{cursor_y}): {e}")))?;
-    let info = &screen.display_info;
-    Ok(CursorMonitor {
-        screen,
-        monitor: MonitorInfo {
-            scale_factor: info.scale_factor as f64,
-            x: info.x,
-            y: info.y,
-            width: info.width,
-            height: info.height,
-        },
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn capture_screen_rgba(monitor: &CursorMonitor) -> AppResult<(Vec<u8>, u32, u32)> {
-    let capture = monitor
-        .screen
-        .capture()
-        .map_err(|e| AppError::Capture(e.to_string()))?;
-    let w = capture.width();
-    let h = capture.height();
-    let rgba = capture.into_raw();
-    Ok((rgba, w, h))
-}
-
-#[cfg(target_os = "windows")]
-fn cursor_position() -> AppResult<(i32, i32)> {
-    #[repr(C)]
-    struct Point {
-        x: i32,
-        y: i32,
-    }
-    extern "system" {
-        fn GetCursorPos(lpPoint: *mut Point) -> i32;
-    }
-    let mut pt = Point { x: 0, y: 0 };
-    let result = unsafe { GetCursorPos(&mut pt) };
-    if result == 0 {
-        return Err(AppError::Capture("GetCursorPos failed".into()));
-    }
-    Ok((pt.x, pt.y))
-}
-
-#[cfg(target_os = "linux")]
-fn cursor_position() -> AppResult<(i32, i32)> {
-    // Wayland doesn't expose global cursor. Linux mint/X11 do via libx11.
-    // For v1 we just default to (0,0) which resolves to the primary screen via from_point.
-    Ok((0, 0))
-}
-
-// ── macOS stubs ─────────────────────────────────────────────────────────────
-//
-// v1: macOS is unsupported. The Node layer surfaces a clear error before
-// even spawning the binary; if the binary is run on macOS anyway, this
-// stub fires. To enable, replace with a `screencapture -x -D <id>` shim
-// or a CoreGraphics FFI binding.
-
-#[cfg(target_os = "macos")]
-pub struct MonitorInfo {
-    pub scale_factor: f64,
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    pub display_id: u32,
-}
-
-#[cfg(target_os = "macos")]
-pub struct CursorMonitor {
-    pub monitor: MonitorInfo,
-}
-
-#[cfg(target_os = "macos")]
-pub fn find_cursor_monitor() -> AppResult<CursorMonitor> {
-    Err(AppError::Capture(
-        "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
-    ))
-}
-
-#[cfg(target_os = "macos")]
-pub fn capture_screen_rgba(_monitor: &CursorMonitor) -> AppResult<(Vec<u8>, u32, u32)> {
-    Err(AppError::Capture(
-        "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
-    ))
-}
-
-#[cfg(target_os = "macos")]
-pub fn find_cursor_monitor_indexed() -> AppResult<(CursorMonitor, usize)> {
-    Err(AppError::Capture(
-        "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
-    ))
-}
-
-#[cfg(target_os = "macos")]
-pub fn monitor_from_index(_index: usize) -> AppResult<CursorMonitor> {
-    Err(AppError::Capture(
-        "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
-    ))
-}
-
-// ── Shared utilities used by `crop` and `loop_capture` ──────────────────────
+// ── 共用像素工具 ─────────────────────────────────────────────────────────────
 
 /// Crop a sub-rectangle from a contiguous RGBA buffer (row-major, row stride = img_w * 4).
 pub fn crop_rgba(rgba: &[u8], img_w: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
@@ -276,17 +189,26 @@ pub fn encode_png(rgba: &[u8], w: u32, h: u32) -> AppResult<Vec<u8>> {
     Ok(png)
 }
 
-// ── CaptureNode — one-shot middleware node ──────────────────────────────────
+// ── CaptureNode：截一帧 ─────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize, Serialize)]
-pub struct CaptureInput {}
+#[serde(rename_all = "camelCase")]
+pub struct CaptureInput {
+    /// 可选：只截虚拟桌面上的这个矩形。缺省 = 整块虚拟桌面。
+    #[serde(default)]
+    pub region: Option<VirtualRegion>,
+}
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptureOutput {
-    /// Base64-encoded PNG of the captured monitor.
+    /// Base64-encoded PNG of the captured region.
     pub png_b64: String,
     pub width: u32,
     pub height: u32,
+    /// 这次实际截取的矩形（缺省整屏时由 Rust 回填，方便调用方知道自己拿到了哪里）。
+    pub x: i32,
+    pub y: i32,
 }
 
 pub struct CaptureNode;
@@ -297,8 +219,18 @@ impl Node for CaptureNode {
     type Output = CaptureOutput;
     const NAME: &'static str = "capture";
 
-    async fn process(&self, _input: Self::Input) -> AppResult<Self::Output> {
-        let (rgba, w, h) = tokio::task::spawn_blocking(crate_core_capture_blocking)
+    async fn process(&self, input: Self::Input) -> AppResult<Self::Output> {
+        // 抓屏是阻塞调用，丢到 blocking 线程，让 async 运行时留给 JSONL 循环。
+        let (rgba, w, h, x, y) =
+            tokio::task::spawn_blocking(move || -> AppResult<(Vec<u8>, u32, u32, i32, i32)> {
+                match input.region {
+                    Some(r) => {
+                        let (rgba, w, h) = capture_virtual_region(&r)?;
+                        Ok((rgba, w, h, r.x, r.y))
+                    }
+                    None => capture_virtual_desktop(),
+                }
+            })
             .await
             .map_err(|e| AppError::Capture(format!("capture join error: {e}")))??;
 
@@ -307,21 +239,10 @@ impl Node for CaptureNode {
             png_b64: BASE64.encode(&png),
             width: w,
             height: h,
+            x,
+            y,
         })
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn crate_core_capture_blocking() -> AppResult<(Vec<u8>, u32, u32)> {
-    let monitor = find_cursor_monitor()?;
-    capture_screen_rgba(&monitor)
-}
-
-#[cfg(target_os = "macos")]
-fn crate_core_capture_blocking() -> AppResult<(Vec<u8>, u32, u32)> {
-    Err(AppError::Capture(
-        "macOS 屏幕截图尚未实现 (v1 仅支持 Windows / Linux)".into(),
-    ))
 }
 
 /// Subprocess entry: invoked as `rsx-sc-rust capture`.

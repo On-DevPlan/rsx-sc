@@ -94,6 +94,35 @@ export function Bubble({ turn }) {
       </div>
     );
   }
+  if (turn.role === 'assistant') {
+    const a = turn.payload;
+    const waiting = !a.done && !a.content;
+    return (
+      <div className="bubble in">
+        <div className="bubble-meta">
+          <span className="tag">AI</span>
+          <span className="muted">帧 #{a.seq}</span>
+        </div>
+        <div className={'bubble-text' + (a.done ? '' : ' streaming')}>
+          {waiting ? '思考中…' : a.content}
+        </div>
+      </div>
+    );
+  }
+  if (turn.role === 'llm_error') {
+    return (
+      <div className="bubble in bad">
+        <div className="bubble-meta">
+          <span className="tag">AI 失败</span>
+          <span className="muted">帧 #{turn.payload.seq}</span>
+        </div>
+        <div className="bubble-text">
+          {turn.payload.error}
+          {turn.payload.code ? ` (${turn.payload.code})` : ''}
+        </div>
+      </div>
+    );
+  }
   return null;
 }
 

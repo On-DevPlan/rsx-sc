@@ -1,9 +1,12 @@
-# rsx-sc — 持续截屏 + 多模态 LLM 观察
+# rsx-sc — 截屏观察循环 + 多模态 LLM
 
-> 本机工具：CLI 与 Web 面板同源。Web 页面按用户选定的区域**持续截屏**，
-> 每帧送进 OpenAI 兼容的多模态 LLM，按用户自定义的提示词模板生成对话；
-> 截图、LLM 回复、用户注解汇成一条「对话记录」流，可被 `npx rsx-sc serve`
-> 起的本地 Web 面板实时查看。
+> 本机工具：CLI 与 Web 面板同源。Web 页面按用户选定的区域**顺序观察**：
+> 截一张 → 交给 OpenAI 兼容的多模态 LLM → **等回复落地** → 再截下一张。
+> 回复是**流式**的，逐字出现在面板上。截图、LLM 回复、用户注解汇成一条
+> 「对话记录」流，可被 `npx rsx-sc serve` 起的本地 Web 面板实时查看。
+>
+> 节奏由模型决定而不是定时器——不会产出「截了却没人看」的帧（那也正是
+> 让人误以为在无限刷屏的原因）。
 
 ## 用法
 
@@ -14,8 +17,10 @@ npx rsx-sc serve
 # 查看二进制解析（v1 仅 Windows x64 与 Linux x64）
 npx rsx-sc capture bin
 
-# 起一个截屏会话（CLI 与 HTTP 同源）
-npx rsx-sc capture start --region "0,0,800,600" --intervalMs 500
+# 起一个观察会话（截一张 → 等模型回复 → 再截下一张）
+npx rsx-sc capture start --region "0,0,800,600"
+# --minIntervalMs 只是两轮之间的兜底间隔；节奏由模型回复决定
+# --maxFrames 留空 = 一直观察到停止
 
 # 或者：弹原生全屏蒙版，鼠标框选一个区域（Esc / 右键取消）
 npx rsx-sc capture select
@@ -58,10 +63,10 @@ npx rsx-sc settings test
 
 | 子命令         | 行为                                 |
 | -------------- | ------------------------------------ |
-| `capture`      | 单次 BitBlt 截屏（诊断用）           |
+| `capture`      | 截一帧（可指定区域；缺省整块虚拟桌面）|
 | `crop`         | 在 PNG 上裁一个矩形                  |
-| `loop_capture` | 按固定间隔连续截屏一个区域，输出帧流 |
-| `select`       | 原生全屏框选蒙版，输出选中矩形 JSON  |
+| `loop_capture` | 按固定间隔连续输出帧流（原始录制用；面板不走这条）|
+| `select`       | 原生蒙版框选，输出选中矩形 JSON      |
 
 ### 框选蒙版 `select`
 

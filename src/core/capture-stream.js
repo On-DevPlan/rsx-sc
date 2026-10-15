@@ -44,17 +44,13 @@ export function handleCaptureStream(req, res, url) {
   const unsubscribe = subscribe(sessionId, (msg) => {
     if (!msg) return;
     try {
-      if (msg.type === 'frame') {
-        res.write(`data: ${JSON.stringify({ type: 'frame', ...msg.payload })}\n\n`);
-      } else if (msg.type === 'status') {
-        res.write(`data: ${JSON.stringify({ type: 'status', ...msg.payload })}\n\n`);
-      } else if (msg.type === 'complete') {
-        res.write(`data: ${JSON.stringify({ type: 'complete', ...msg.payload })}\n\n`);
-      } else if (msg.type === 'error') {
+      // error 的 payload 是字符串，单独包一层；其余都是对象，原样展开。
+      if (msg.type === 'error') {
         res.write(`data: ${JSON.stringify({ type: 'error', message: String(msg.payload) })}\n\n`);
-      } else if (msg.type === 'end') {
-        res.write(`data: ${JSON.stringify({ type: 'end', ...msg.payload })}\n\n`);
+        return;
       }
+      const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
+      res.write(`data: ${JSON.stringify({ type: msg.type, ...payload })}\n\n`);
     } catch {
       // Connection closed mid-write — handled by req.close below.
     }

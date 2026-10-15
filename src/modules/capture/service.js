@@ -4,17 +4,14 @@ import {
   createSession,
   listSessions,
   stopSession,
-  subscribe,
 } from '../../core/capture-session.js';
 import {
-  chatCompletion,
+  chatCompletionStream,
   buildVisionMessages,
 } from '../../core/llm-client.js';
 import { readSettings } from '../../core/settings-store.js';
 import { runSelection } from '../../core/select-client.js';
 import { badInput, external } from '../../core/errors/index.js';
-
-const MIN_INTERVAL_MS = 50;
 
 /**
  * Resolve the rust binary path. Returns a structured object even on failure
@@ -60,7 +57,7 @@ export async function bin() {
  * @param {{region: string, intervalMs: number, maxFrames?: number|null}} opts
  * @returns {Promise<{sessionId: string, startedAt: number, region: object, intervalMs: number, maxFrames: number|null}>}
  */
-export async function start({ region, intervalMs, maxFrames }) {
+export async function start({ region, minIntervalMs, maxFrames }) {
   const r = resolveBinary();
   if (!r) {
     if (!isSupported(process.platform, process.arch)) {
@@ -75,23 +72,32 @@ export async function start({ region, intervalMs, maxFrames }) {
       `region 格式应为 "x,y,w,h"（整数；x/y 可为负，w/h 必须为正），收到: ${region}`
     );
   }
-  const interval = Number(intervalMs);
-  if (!Number.isFinite(interval) || interval < MIN_INTERVAL_MS) {
-    throw badInput(`intervalMs 必须 ≥ ${MIN_INTERVAL_MS}（收到: ${intervalMs}）`);
+  const gap = Number(minIntervalMs ?? 0);
+  if (!Number.isFinite(gap) || gap < 0) {
+    throw badInput(`minIntervalMs 不能为负（收到: ${minIntervalMs}）`);
   }
 
+  // 闸门用「间接引用」拿 llm：createSession 必须先于 attachLlm 返回，而 gate
+  // 首次被调用时（第一帧到手之后）llm 已经赋值。
+  let llm = null;
   const session = createSession({
     region: parsed,
-    intervalMs: interval,
+    minIntervalMs: gap,
     maxFrames: maxFrames ?? null,
     binPath: r.path,
+    gate: () => (llm ? llm.whenIdle() : Promise.resolve(true)),
+    release: () => {
+      if (llm) llm.release();
+    },
   });
+  // 接上 LLM 观察：流式回写，并作为采集节奏的闸门。
+  llm = attachLlm(session);
 
   return {
     sessionId: session.sessionId,
     startedAt: session.startedAt,
     region: parsed,
-    intervalMs: interval,
+    minIntervalMs: gap,
     maxFrames: maxFrames ?? null,
   };
 }
@@ -154,119 +160,108 @@ function parseRegion(s) {
 }
 
 /**
- * Run a single frame through the LLM with the current settings + history.
- * Returns the assistant content (string). Errors propagate as NxError.
+ * 把 LLM 观察接到会话上：订阅 frame，把这一帧发给多模态模型，流式增量写回
+ * **同一个 emitter** —— 于是 SSE / 面板 / 未来任何消费者看到的是同一条流
+ * （frame / llm_start / llm_delta / llm_end / llm_error）。
  *
- * @param {{sessionId: string, frame: {seq:number, capturedAtMs:number, pngB64:string, width:number, height:number}, history: Array<{role:'user'|'assistant', content:string}>}} opts
+ * 返回的 `whenIdle()` 供采集循环当闸门用：**等这一帧的回复落地，再截下一张**。
+ * 这样每一帧都配一条回复，不会产出没人看的帧。
+ *
+ * 之前这函数叫 bridgeToLlm 但**从未被调用**，而且把事件发到一个没人监听的
+ * 独立 emitter 上 —— 表现为「帧一直刷、LLM 一次都没被调用」。现在由 start()
+ * 直接调用，事件走会话自身的 emitter。
  */
-export async function describeFrame({ frame, history }) {
-  const settings = (await readSettings()).settings;
-  const messages = buildVisionMessages({
-    promptTemplate: settings.promptTemplate,
-    history,
-    framePngB64: frame.pngB64,
-    frameMeta: {
-      seq: frame.seq,
-      capturedAtMs: frame.capturedAtMs,
-      width: frame.width,
-      height: frame.height,
-    },
-    isFirstRound: history.length === 0,
-  });
-  const out = await chatCompletion({
-    apiBase: settings.apiBase,
-    apiKey: settings.apiKey,
-    model: settings.model,
-    messages,
-    temperature: settings.temperature,
-  });
-  return out.content;
-}
-
-/**
- * Subscribe to a session's frame stream; for each frame, dispatch an LLM
- * call (one-in-flight) and emit both frame + llm events into a single
- * emitter the SSE / view consumer can use.
- *
- * One-in-flight: while a call is pending, incoming frames drop the LLM
- * trigger (they still stream to the UI). Calls use AbortController so on
- * session stop the in-flight call is cancelled.
- *
- * @param {string} sessionId
- * @param {EventEmitter} outEmitter
- * @returns {Promise<{unsubscribe: () => void}>}
- */
-export async function bridgeToLlm(sessionId, outEmitter) {
-  const settings = (await readSettings()).settings;
-  let inFlight = null;
+export function attachLlm(session) {
+  const emitter = session.emitter;
   const history = [];
-  const maxHistory = Math.max(1, settings.maxHistoryTurns || 10);
+  let inFlight = null;
+  let settings = null;
+  let closed = false;
+  let lastOk = true;
+  let idleResolvers = [];
 
-  const unsub = subscribe(sessionId, async (msg) => {
-    if (msg.type === 'frame') {
-      const frame = msg.payload;
-      outEmitter.emit('frame', frame);
-      if (inFlight) {
-        outEmitter.emit('skip', { seq: frame.seq });
-        return;
-      }
-      const ctrl = new AbortController();
-      inFlight = ctrl;
-      (async () => {
-        try {
-          const messages = buildVisionMessages({
-            promptTemplate: settings.promptTemplate,
-            history: history.slice(-maxHistory * 2),
-            framePngB64: frame.pngB64,
-            frameMeta: {
-              seq: frame.seq,
-              capturedAtMs: frame.capturedAtMs,
-              width: frame.width,
-              height: frame.height,
-            },
-            isFirstRound: history.length === 0,
-          });
-          const out = await chatCompletion({
-            apiBase: settings.apiBase,
-            apiKey: settings.apiKey,
-            model: settings.model,
-            messages,
-            signal: ctrl.signal,
-            temperature: settings.temperature,
-          });
-          const assistantText = out.content;
-          history.push({ role: 'user', content: settings.promptTemplate });
-          history.push({ role: 'assistant', content: assistantText });
-          if (history.length > maxHistory * 2) {
-            history.splice(0, history.length - maxHistory * 2);
-          }
-          outEmitter.emit('llm', {
+  const markIdle = () => {
+    inFlight = null;
+    const waiters = idleResolvers;
+    idleResolvers = [];
+    for (const r of waiters) r();
+  };
+
+  const onFrame = (frame) => {
+    if (closed || inFlight) return;
+    const ctrl = new AbortController();
+    // 同步置位：调用方（采集循环）紧接着就会调 whenIdle()，必须已经看到「在飞」。
+    inFlight = ctrl;
+    (async () => {
+      try {
+        // 每个会话首次用帧时才读盘：一次读、全会话复用。
+        if (!settings) settings = (await readSettings()).settings;
+        const maxHistory = Math.max(1, settings.maxHistoryTurns || 10);
+        const messages = buildVisionMessages({
+          promptTemplate: settings.promptTemplate,
+          history: history.slice(-maxHistory * 2),
+          framePngB64: frame.pngB64,
+          frameMeta: {
             seq: frame.seq,
-            content: assistantText,
             capturedAtMs: frame.capturedAtMs,
-          });
-        } catch (e) {
-          if (e && e.name === 'AbortError') return;
-          outEmitter.emit('llm_error', { seq: frame.seq, error: String(e?.message || e), code: e?.code });
-        } finally {
-          inFlight = null;
+            width: frame.width,
+            height: frame.height,
+          },
+          isFirstRound: history.length === 0,
+        });
+
+        emitter.emit('llm_start', { seq: frame.seq, capturedAtMs: frame.capturedAtMs });
+        const out = await chatCompletionStream({
+          apiBase: settings.apiBase,
+          apiKey: settings.apiKey,
+          model: settings.model,
+          messages,
+          signal: ctrl.signal,
+          temperature: settings.temperature,
+          onDelta: (text) => emitter.emit('llm_delta', { seq: frame.seq, text }),
+        });
+
+        history.push({ role: 'user', content: settings.promptTemplate });
+        history.push({ role: 'assistant', content: out.content });
+        if (history.length > maxHistory * 2) {
+          history.splice(0, history.length - maxHistory * 2);
         }
-      })();
-    } else if (msg.type === 'status') {
-      outEmitter.emit('status', msg.payload);
-    } else if (msg.type === 'complete') {
-      outEmitter.emit('complete', msg.payload);
-    } else if (msg.type === 'end') {
-      outEmitter.emit('end', msg.payload);
-      if (inFlight) inFlight.abort();
-    } else if (msg.type === 'error') {
-      outEmitter.emit('error', msg.payload);
-    }
+        lastOk = true;
+        emitter.emit('llm_end', { seq: frame.seq, content: out.content });
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // 被取消，不算失败
+        lastOk = false;
+        emitter.emit('llm_error', {
+          seq: frame.seq,
+          error: String(e && (e.message || e)),
+          code: e && e.code,
+        });
+      } finally {
+        markIdle();
+      }
+    })();
+  };
+
+  emitter.on('frame', onFrame);
+  emitter.on('end', (info) => {
+    closed = true;
+    // 正常跑完（达到 max_frames）**不算取消**：让在飞的调用跑完并把回复发出去。
+    // 只有被 kill / 启动失败才掐断。
+    const normal = info && info.reason === 'complete';
+    if (inFlight && !normal) inFlight.abort();
   });
 
   return {
-    unsubscribe: () => {
-      unsub();
+    /**
+     * 等当前在飞的调用结束（没有在飞就立即返回）。
+     * @returns {Promise<boolean>} 这一轮是否成功 —— 采集循环据此决定要不要退避。
+     */
+    async whenIdle() {
+      if (inFlight) await new Promise((r) => idleResolvers.push(r));
+      return lastOk;
+    },
+    /** 停止会话时用：掐断在飞的调用，让 whenIdle 立刻解开，不必等模型返回。 */
+    release() {
       if (inFlight) inFlight.abort();
     },
   };

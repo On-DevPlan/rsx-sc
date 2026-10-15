@@ -1,6 +1,6 @@
 [package]
 name = "rsx-sc-rust"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "rsx-sc screenshot capture binary — standalone Rust port of the tauri2 capture pipeline (no GUI framework, JSONL stdio)."
 authors = ["On-DevPlan"]

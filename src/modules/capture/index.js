@@ -25,20 +25,21 @@ export default {
       id: 'capture.start',
       cli: ['capture', 'start'],
       http: ['POST', '/api/capture/start'],
-      summary: '开始一个截屏会话（region 为虚拟桌面绝对坐标）',
+      summary: '开始观察：截一张 → 问模型 → 等回复 → 再截下一张（region 为虚拟桌面绝对坐标）',
       flags: {
         region: { type: 'string', default: '0,0,800,600', hint: 'x,y,w,h' },
-        intervalMs: { type: 'number', default: 500 },
+        minIntervalMs: { type: 'number', default: 0, hint: '两轮之间的最小间隔' },
         maxFrames: { type: 'number', default: null },
       },
       run: async (ctx) => {
         return service.start({
           region: ctx.region,
-          intervalMs: ctx.intervalMs,
+          minIntervalMs: ctx.minIntervalMs,
           maxFrames: ctx.maxFrames,
         });
       },
-      render: (r) => `session: ${r.sessionId}\n  region=${JSON.stringify(r.region)}  intervalMs=${r.intervalMs}  maxFrames=${r.maxFrames ?? '∞'}`,
+      render: (r) =>
+        `session: ${r.sessionId}\n  region=${JSON.stringify(r.region)}  minIntervalMs=${r.minIntervalMs}  maxFrames=${r.maxFrames ?? '∞'}\n  节奏由模型决定：每帧发出后等回复落地，再截下一张`,
     },
     {
       id: 'capture.select',
