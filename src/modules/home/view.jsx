@@ -61,7 +61,7 @@ export default function HomeView() {
           </div>
         ))}
         {routes && !routes.routes.length && <div className="empty">暂无命令</div>}
-        <CliHints command="rsx-sc routes" note="这两张表由同一份 action 声明派生" />
+        <CliHints module="home" />
       </div>
     </div>
   );

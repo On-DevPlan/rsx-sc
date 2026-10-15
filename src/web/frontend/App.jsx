@@ -1,6 +1,6 @@
 // 面板壳：tab 导航 + 当前视图。**这个文件几乎不需要改**——
 // 新增面板 = 在 registry.js 登记一行 + 写一个 view.jsx。
-import { Suspense, useEffect } from 'react';
+import { Suspense, useEffect, useRef } from 'react';
 import { VIEWS } from './registry.js';
 import { useStore } from './store.jsx';
 import { ErrorBoundary } from './components/ui.jsx';
@@ -30,7 +30,15 @@ export default function App() {
     else if (!location.hash && ui.view) location.hash = '#/' + ui.view;
   }, []);
 
+  // 回写 hash。**首次渲染必须跳过**：挂载那一刻 ui.view 还是 localStorage 里的
+  // 旧值，无条件回写会把深链接（别人分享的 #/capture）冲成 #/home，紧接着
+  // 触发的 hashchange 又把 state 也改回去——表现就是「打开链接却回到首页」。
+  const hashWriteReady = useRef(false);
   useEffect(() => {
+    if (!hashWriteReady.current) {
+      hashWriteReady.current = true;
+      return;
+    }
     if (ui.view) location.hash = '#/' + ui.view;
   }, [ui.view]);
 

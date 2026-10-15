@@ -1,5 +1,6 @@
 // capture 视图的展示组件：数字输入、对话气泡、转录裁剪。
 // 从 view.jsx 拆出——eslint max-lines(300) 要求视图壳只留编排逻辑。
+import { CliHints } from '../../web/frontend/components/CliHints.jsx';
 
 // 转录最多保留的气泡数（DOM 上限，防长会话卡顿）。
 const MAX_TURNS = 200;
@@ -33,10 +34,11 @@ export function BinCard({ bin }) {
     return (
       <div className="empty bad">
         未找到 rsx-sc-rust 二进制：{bin.reason}
-        <CliHints
-          command="cd rust/rsx-sc-rust && cargo build --release"
-          note="构建后复制到 binaries/<key>/ 或安装平台分包 @ondevplann/rsx-sc-rust-<key>"
-        />
+        <div className="muted" style={{ marginTop: 6 }}>
+          构建：<code>cd rust/rsx-sc-rust && cargo build --release</code>，把产物复制到
+          <code>binaries/&lt;平台&gt;-&lt;架构&gt;/</code>
+        </div>
+        <CliHints module="capture" />
       </div>
     );
   }
@@ -54,7 +56,7 @@ export function BinCard({ bin }) {
         <div className="name">平台</div>
         <div className="desc mono">{bin.platform}/{bin.arch}</div>
       </div>
-      <CliHints command="rsx-sc capture bin" note="CLI 与 HTTP 返回同一份解析结果" />
+      <CliHints module="capture" />
     </div>
   );
 }

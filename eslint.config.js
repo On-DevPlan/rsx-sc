@@ -92,6 +92,53 @@ export default defineConfig([
     rules: { 'react/jsx-uses-vars': 'error' },
   },
 
+  // 只对 .jsx 打开 no-undef + react/jsx-no-undef。
+  //
+  // BASE_RULES 里关掉 no-undef 的理由是「浏览器/Node 全局混用」——那条理由
+  // 对 .jsx 不成立：它们只会被 vite 打进浏览器包，不存在 Node 侧用法。
+  //
+  // 这两条规则不是风格偏好，是**防呆**：把一段 JSX 拆到新文件却忘了把组件
+  // import 过去，是拆分文件时最典型的失误。运行时才炸（ReferenceError），
+  // 构建期静默通过——只有用户点开那个页面才发现。加这两条之前，它就是这么
+  // 漏过去的。
+  //
+  // 为什么是两条而不是一条：**no-undef 不检查 JSX 元素名**。`<Foo />` 里的
+  // Foo 未定义时它保持沉默（已实测），只有 `react/jsx-no-undef` 会报。
+  // 反过来 `react/jsx-no-undef` 又只管 JSX 标签，普通表达式里的未定义引用
+  // （如 `SomeUndefinedFn()`）得靠 no-undef。缺任何一条都留着半个缺口。
+  {
+    files: ['**/*.jsx'],
+    languageOptions: {
+      globals: {
+        window: 'readonly',
+        document: 'readonly',
+        navigator: 'readonly',
+        location: 'readonly',
+        localStorage: 'readonly',
+        sessionStorage: 'readonly',
+        console: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+        requestAnimationFrame: 'readonly',
+        fetch: 'readonly',
+        EventSource: 'readonly',
+        AbortController: 'readonly',
+        URL: 'readonly',
+        URLSearchParams: 'readonly',
+        CustomEvent: 'readonly',
+        alert: 'readonly',
+        confirm: 'readonly',
+        prompt: 'readonly',
+      },
+    },
+    rules: {
+      'no-undef': 'error',
+      'react/jsx-no-undef': 'error',
+    },
+  },
+
   // 字符数闸门：覆盖所有被 lint 的文件，**不**给 scripts/ 与 tools/ 开豁免 ——
   // 下面那条 max-lines 豁免管的是「结构」，体积上限是产品约束，两者不是一回事。
   {

@@ -142,10 +142,7 @@ export default function SettingsView() {
               : `✗ ${testResult.error}${testResult.code ? ' (' + testResult.code + ')' : ''}`}
           </div>
         ) : null}
-        <CliHints
-          command="rsx-sc settings get"
-          note="修改提示词模板即可改变 LLM 的「观察视角」；模板与配置保存在 ~/.rsx-sc/settings.json"
-        />
+        <CliHints module="settings" />
       </div>
     </div>
   );

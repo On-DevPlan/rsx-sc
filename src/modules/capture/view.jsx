@@ -217,10 +217,7 @@ export default function CaptureView() {
             )}
           </div>
         </div>
-        <CliHints
-          command={`rsx-sc capture start --region "${region.x},${region.y},${region.w},${region.h}" --intervalMs ${intervalMs}${maxFrames ? ` --maxFrames ${maxFrames}` : ''}`}
-          note="同一份 action 同时给 CLI 与 HTTP 使用；面板按钮等价于这条命令"
-        />
+        <CliHints module="capture" />
       </div>
 
       <div className="card">

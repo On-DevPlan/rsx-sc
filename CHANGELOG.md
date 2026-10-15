@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.1 — 2026-10-15
+
+### 修复
+
+- **面板「截屏」页直接崩掉**（`CliHints is not defined`）。0.3.0 里把
+  `BinCard` 等展示组件拆到 `parts.jsx` 时，漏了把 `CliHints` 一起 import
+  过去——JSX 里用了但没引入，构建期静默通过，只有点开页面才炸。
+- **所有 `CliHints` 都没渲染**。该组件的契约是 `module` 属性（命令列表从
+  bootstrap 的命令表派生），而五处调用（capture ×3、settings、home）
+  传的都是 `command` / `note`——属性被忽略 → 命令列表为空 → 静默返回 null。
+  这处是脚手架自带的既有问题，这次一并改正为 `module="<域>"`。
+- **深链接被重定向回首页**。打开 `#/capture` 会落到 `#/home`：挂载时
+  「回写 hash」的 effect 用 localStorage 里的旧视图覆盖了深链接，随后的
+  `hashchange` 又把 state 改回去。现在该 effect 跳过首次渲染。
+  这处同样是既有问题。
+
+### 加固
+
+- eslint 对 `.jsx` 打开 `no-undef` + `react/jsx-no-undef`。
+  基础配置里关掉 `no-undef` 的理由是「浏览器/Node 全局混用」，但 `.jsx`
+  只会被 vite 打进浏览器包，不存在该问题——可以安全打开。
+  **两条都要**：实测 `no-undef` 不检查 JSX 元素名（`<Foo />` 里的 Foo
+  未定义时它保持沉默），只有 `react/jsx-no-undef` 会报；反过来它又管不到
+  普通表达式里的未定义引用。已做反向测试确认破坏后会变红。
+
 ## 0.3.0 — 2026-10-15
 
 ### 新增
