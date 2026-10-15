@@ -21,6 +21,22 @@ export default function CaptureView() {
   const [note, setNote] = useState('');
   const esRef = useRef(null);
   const seenRef = useRef(new Set()); // dedupe by frame.seq
+  const chatRef = useRef(null);
+  // 是否贴底跟随。用户往上翻看历史时置 false —— 此时新的流式分片不该把他拽回底部。
+  const stickRef = useRef(true);
+
+  // 转录变化就滚到底（流式每来一个分片都会走这里，所以「逐字增长」是跟着滚的）。
+  useEffect(() => {
+    const el = chatRef.current;
+    if (!el || !stickRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [turns]);
+
+  const onChatScroll = useCallback(() => {
+    const el = chatRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  }, []);
 
   // Resolve binary path on mount.
   useEffect(() => {
@@ -272,7 +288,7 @@ export default function CaptureView() {
           <span>对话记录</span>
           <span className="tag">{turns.length}</span>
         </div>
-        <div className="chat">
+        <div className="chat" ref={chatRef} onScroll={onChatScroll}>
           {turns.map((t, i) => (
             <Bubble key={i} turn={t} />
           ))}
